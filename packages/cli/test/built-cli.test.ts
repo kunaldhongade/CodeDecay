@@ -250,6 +250,17 @@ describe("built codedecay CLI", () => {
     expect(update.status).toBe(0);
     expect(update.stdout).toContain("Package manager: pnpm (package.json#packageManager)");
     expect(update.stdout).toContain("pnpm add -D @submux/codedecay@latest");
+
+    const uninstallHelp = runBuilt(["help", "uninstall"]);
+    expect(uninstallHelp.status).toBe(0);
+    expect(uninstallHelp.stdout).toContain("--purge-local");
+
+    writeFile(cwd, ".codedecay/config.yml", "version: 1\n");
+    writeFile(cwd, "codedecay-redteam.md", "# report\n");
+    const uninstall = runBuilt(["uninstall", "--cwd", cwd, "--purge-local"]);
+    expect(uninstall.status).toBe(0);
+    expect(uninstall.stdout).toContain("pnpm remove @submux/codedecay");
+    expect(uninstall.stdout).toContain(".codedecay");
   });
 
   it("suggests similar commands and flags from the built CLI", () => {

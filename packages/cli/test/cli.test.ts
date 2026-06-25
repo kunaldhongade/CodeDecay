@@ -247,6 +247,50 @@ describe("codedecay CLI discovery commands", () => {
     expect(update.stdout).toContain('Run "codedecay update --apply" to execute it automatically.');
   });
 
+  it("prints uninstall guidance and purge targets", async () => {
+    const cwd = createTempDir();
+    writeFile(
+      cwd,
+      "package.json",
+      JSON.stringify(
+        {
+          name: "demo-repo",
+          private: true,
+          packageManager: "pnpm@11.8.0",
+          devDependencies: {
+            "@submux/codedecay": currentCliVersion()
+          }
+        },
+        null,
+        2
+      )
+    );
+    writeFile(cwd, ".codedecay/config.yml", "version: 1\n");
+    writeFile(cwd, "codedecay-redteam.md", "# report\n");
+
+    const result = await run(["uninstall", "--purge-local"], cwd);
+
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain("Package manager: pnpm (package.json#packageManager)");
+    expect(result.stdout).toContain(`Package entry: devDependencies (${currentCliVersion()})`);
+    expect(result.stdout).toContain("pnpm remove @submux/codedecay");
+    expect(result.stdout).toContain(".codedecay");
+    expect(result.stdout).toContain("codedecay-redteam.md");
+    expect(result.stdout).toContain("does not rewrite CI workflows");
+  });
+
+  it("can apply a local-only uninstall purge", async () => {
+    const cwd = createTempDir();
+    writeFile(cwd, ".codedecay/config.yml", "version: 1\n");
+    writeFile(cwd, "codedecay.sarif", "{}\n");
+
+    const result = await run(["uninstall", "--purge-local", "--apply"], cwd);
+
+    expect(result.exitCode).toBe(0);
+    expect(existsSync(join(cwd, ".codedecay"))).toBe(false);
+    expect(existsSync(join(cwd, "codedecay.sarif"))).toBe(false);
+  });
+
   it("suggests the closest command for unknown command typos", async () => {
     const cwd = createTempDir();
 

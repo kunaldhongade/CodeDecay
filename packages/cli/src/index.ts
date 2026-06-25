@@ -1,5 +1,5 @@
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
@@ -97,6 +97,13 @@ interface UpdateOptions {
   apply: boolean;
 }
 
+interface UninstallOptions {
+  cwd?: string | undefined;
+  manager?: PackageManager | undefined;
+  apply: boolean;
+  purgeLocal: boolean;
+}
+
 interface UpdatePlan {
   manager?: PackageManager | undefined;
   source: string;
@@ -104,6 +111,18 @@ interface UpdatePlan {
   command: string;
   args: string[];
   canApply: boolean;
+}
+
+interface UninstallPlan {
+  manager?: PackageManager | undefined;
+  source: string;
+  displayCommand?: string | undefined;
+  command?: string | undefined;
+  args: string[];
+  canApplyPackage: boolean;
+  dependencyLocation: "devDependencies" | "dependencies" | "optionalDependencies" | "none";
+  dependencyVersion?: string | undefined;
+  purgeTargets: string[];
 }
 
 interface ExecutionReport {
@@ -228,8 +247,9 @@ const VALID_RISK_LEVELS = new Set<RiskLevel>(["low", "medium", "high"]);
 const VALID_PACKAGE_MANAGERS = new Set<PackageManager>(["npm", "pnpm", "yarn", "bun"]);
 const PACKAGE_NAME = "@submux/codedecay";
 const COMMAND_ORDER = ["analyze", "redteam", "agent", "config", "memory", "execute", "differential", "mcp"] as const;
-const UTILITY_COMMAND_ORDER = ["help", "man", "update", "version"] as const;
+const UTILITY_COMMAND_ORDER = ["help", "man", "update", "uninstall", "version"] as const;
 const ROOT_FLAG_ALIASES = ["--help", "-h", "--version", "-V"] as const;
+const CODEDECAY_PURGE_FILE_PATTERN = /^codedecay(?:[-_.][a-z0-9._-]+)?\.(?:json|md|sarif|txt)$/i;
 
 class CliExit extends Error {
   constructor(readonly exitCode: number) {
@@ -431,6 +451,28 @@ const HELP_DOCS: Record<string, CommandDoc> = {
       "Update never executes automatically. You must pass --apply to run the package-manager command."
     ]
   },
+  uninstall: {
+    name: "uninstall",
+    summary: "Print or apply the recommended uninstall and cleanup plan.",
+    usage: ["codedecay uninstall [options]"],
+    description: [
+      "Detect the repository package manager and print the safest removal command for `@submux/codedecay`. Optionally purge repo-local CodeDecay state and generated artifacts."
+    ],
+    options: [
+      { flag: "--cwd <path>", description: "Working directory used for package-manager detection" },
+      { flag: "--manager <name>", description: "Override detection with npm, pnpm, yarn, or bun" },
+      { flag: "--purge-local", description: "Also remove local `.codedecay/` state and detected CodeDecay report artifacts" },
+      { flag: "--apply", description: "Execute the uninstall and optional purge instead of only printing the plan" }
+    ],
+    examples: [
+      "codedecay uninstall",
+      "codedecay uninstall --cwd ../my-repo --purge-local",
+      "codedecay uninstall --manager pnpm --purge-local --apply"
+    ],
+    notes: [
+      "Uninstall does not rewrite CI workflows, docs links, or other user-authored references automatically."
+    ]
+  },
   version: {
     name: "version",
     summary: "Print the installed CodeDecay version.",
@@ -530,6 +572,20 @@ async function run(args: string[], runtime: CliRuntime): Promise<void | number> 
     return;
   }
 
+  if (command === "uninstall") {
+    if (commandArgs.includes("--help") || commandArgs.includes("-h")) {
+      printHelp(runtime, "uninstall");
+      return;
+    }
+
+    await runUninstallCommand({
+      args: commandArgs,
+      runtime,
+      runtimeCwd
+    });
+    return;
+  }
+
   if (commandArgs.includes("--help") || commandArgs.includes("-h")) {
     printHelp(runtime, command);
     return;
@@ -587,6 +643,48 @@ async function runUpdateCommand(context: CliCommandContext): Promise<void> {
 
   if (result.status !== 0) {
     throw new CliExit(result.status ?? 1);
+  }
+}
+
+async function runUninstallCommand(context: CliCommandContext): Promise<void> {
+  const options = parseUninstallArgs(context.args);
+  const cwd = resolve(context.runtimeCwd, options.cwd ?? ".");
+  const plan = createUninstallPlan(cwd, options);
+
+  writeStdout(
+    context.runtime,
+    renderUninstallPlan({
+      cwd,
+      plan,
+      apply: options.apply,
+      purgeLocal: options.purgeLocal
+    })
+  );
+
+  if (!options.apply) {
+    return;
+  }
+
+  const canPurge = options.purgeLocal && plan.purgeTargets.length > 0;
+  if (!plan.canApplyPackage && !canPurge) {
+    throw new Error('No uninstall actions are available. Run "codedecay uninstall" to inspect the cleanup plan.');
+  }
+
+  if (plan.canApplyPackage && plan.command) {
+    const result = spawnSync(plan.command, plan.args, {
+      cwd,
+      stdio: "inherit"
+    });
+
+    if (result.status !== 0) {
+      throw new CliExit(result.status ?? 1);
+    }
+  }
+
+  if (canPurge) {
+    for (const target of plan.purgeTargets) {
+      rmSync(join(cwd, target), { recursive: true, force: true });
+    }
   }
 }
 
@@ -974,6 +1072,61 @@ function parseUpdateArgs(args: string[]): UpdateOptions {
     }
 
     throwUnknownOption(arg, "update");
+  }
+
+  return options;
+}
+
+function parseUninstallArgs(args: string[]): UninstallOptions {
+  const options: UninstallOptions = {
+    apply: false,
+    purgeLocal: false
+  };
+
+  for (let index = 0; index < args.length; index += 1) {
+    const arg = args[index];
+
+    if (!arg) {
+      continue;
+    }
+
+    if (arg === "--help" || arg === "-h") {
+      throw new HelpRequested();
+    }
+
+    if (arg === "--apply") {
+      options.apply = true;
+      continue;
+    }
+
+    if (arg === "--purge-local") {
+      options.purgeLocal = true;
+      continue;
+    }
+
+    if (arg.startsWith("--cwd=")) {
+      options.cwd = arg.slice("--cwd=".length);
+      continue;
+    }
+
+    if (arg === "--cwd") {
+      options.cwd = requireValue(args, index, arg);
+      index += 1;
+      continue;
+    }
+
+    if (arg.startsWith("--manager=")) {
+      options.manager = parsePackageManager(arg.slice("--manager=".length));
+      continue;
+    }
+
+    if (arg === "--manager") {
+      options.manager = parsePackageManager(requireValue(args, index, arg));
+      index += 1;
+      continue;
+    }
+
+    throwUnknownOption(arg, "uninstall");
   }
 
   return options;
@@ -2313,6 +2466,7 @@ function renderRootHelp(): string {
     "  codedecay help [command]",
     "  codedecay man [command]",
     "  codedecay update [options]",
+    "  codedecay uninstall [options]",
     "  codedecay version",
     "",
     "Commands:"
@@ -2334,6 +2488,7 @@ function renderRootHelp(): string {
     "  codedecay redteam --base main --head HEAD --format markdown",
     "  codedecay agent --profile codex --format markdown",
     "  codedecay help analyze",
+    "  codedecay uninstall --purge-local",
     "  codedecay man update",
     "",
     'Run "codedecay help <command>" for command-specific flags.'
@@ -2403,6 +2558,7 @@ function renderRootManual(): string {
     "  codedecay man <command>    Show a longer command manual",
     "  codedecay version          Print the installed version",
     "  codedecay update           Print the recommended upgrade command",
+    "  codedecay uninstall       Print the recommended uninstall and cleanup plan",
     "",
     "COMMANDS"
   ];
@@ -2531,6 +2687,105 @@ function renderUpdatePlan(input: { cwd: string; plan: UpdatePlan; apply: boolean
   return `${lines.join("\n")}\n`;
 }
 
+function createUninstallPlan(cwd: string, options: UninstallOptions): UninstallPlan {
+  const detection = options.manager ? { manager: options.manager, source: "override" } : detectPackageManager(cwd);
+  const dependency = detectPackageDependency(cwd);
+  const purgeTargets = options.purgeLocal ? detectPurgeTargets(cwd) : [];
+  const manager = detection?.manager;
+
+  if (!manager) {
+    return {
+      source: "none",
+      args: [],
+      canApplyPackage: false,
+      dependencyLocation: dependency.location,
+      dependencyVersion: dependency.version,
+      purgeTargets
+    };
+  }
+
+  const removal = packageManagerRemoveCommand(manager);
+  return {
+    manager,
+    source: detection?.source ?? "default",
+    displayCommand: removal.displayCommand,
+    command: removal.command,
+    args: removal.args,
+    canApplyPackage: dependency.location !== "none",
+    dependencyLocation: dependency.location,
+    dependencyVersion: dependency.version,
+    purgeTargets
+  };
+}
+
+function renderUninstallPlan(input: {
+  cwd: string;
+  plan: UninstallPlan;
+  apply: boolean;
+  purgeLocal: boolean;
+}): string {
+  const lines = [
+    "CodeDecay uninstall",
+    "",
+    `Current CLI version: ${CODEDECAY_VERSION}`,
+    `Working directory: ${input.cwd}`
+  ];
+
+  if (input.plan.manager) {
+    lines.push(`Package manager: ${input.plan.manager} (${input.plan.source})`);
+  } else {
+    lines.push("Package manager: not detected");
+  }
+
+  const location =
+    input.plan.dependencyLocation === "none"
+      ? "not listed in package.json"
+      : `${input.plan.dependencyLocation}${input.plan.dependencyVersion ? ` (${input.plan.dependencyVersion})` : ""}`;
+  lines.push(`Package entry: ${location}`);
+
+  lines.push("");
+  if (input.plan.displayCommand) {
+    lines.push("Recommended uninstall command:", `  ${input.plan.displayCommand}`);
+  } else {
+    lines.push(`No supported package manager command detected for ${PACKAGE_NAME}.`);
+  }
+
+  lines.push("");
+  if (input.purgeLocal) {
+    lines.push("Local purge targets:");
+    if (input.plan.purgeTargets.length === 0) {
+      lines.push("  none detected");
+    } else {
+      for (const target of input.plan.purgeTargets) {
+        lines.push(`  ${target}`);
+      }
+    }
+  } else {
+    lines.push("Local purge targets: skipped");
+    lines.push('  Pass "--purge-local" to also remove `.codedecay/` and detected CodeDecay report artifacts.');
+  }
+
+  lines.push(
+    "",
+    "Notes:",
+    "  - Uninstall does not rewrite CI workflows, package scripts, or docs references automatically.",
+    "  - Review GitHub Actions and README snippets manually if this repo integrated CodeDecay there."
+  );
+
+  if (input.apply) {
+    lines.push("");
+    if (input.plan.canApplyPackage || (input.purgeLocal && input.plan.purgeTargets.length > 0)) {
+      lines.push("Applying uninstall plan...");
+    } else {
+      lines.push("Automatic apply is unavailable for this uninstall plan.");
+    }
+  } else {
+    lines.push("", 'Run "codedecay uninstall --apply" to execute the plan.');
+  }
+
+  return `${lines.join("\n")}\n`;
+}
+
 function detectPackageManager(cwd: string): { manager: PackageManager; source: string } | undefined {
   const packageJsonPath = join(cwd, "package.json");
 
@@ -2576,6 +2831,50 @@ function normalizePackageManager(value: string | undefined): PackageManager | un
   return VALID_PACKAGE_MANAGERS.has(normalized as PackageManager) ? (normalized as PackageManager) : undefined;
 }
 
+function detectPackageDependency(
+  cwd: string
+): { location: "devDependencies" | "dependencies" | "optionalDependencies" | "none"; version?: string } {
+  const packageJsonPath = join(cwd, "package.json");
+  if (!existsSync(packageJsonPath)) {
+    return { location: "none" };
+  }
+
+  try {
+    const parsed = JSON.parse(readFileSync(packageJsonPath, "utf8")) as {
+      dependencies?: Record<string, string> | undefined;
+      devDependencies?: Record<string, string> | undefined;
+      optionalDependencies?: Record<string, string> | undefined;
+    };
+
+    for (const section of ["devDependencies", "dependencies", "optionalDependencies"] as const) {
+      const version = parsed[section]?.[PACKAGE_NAME];
+      if (version) {
+        return { location: section, version };
+      }
+    }
+  } catch {
+    // Ignore unreadable package.json when detecting dependency placement.
+  }
+
+  return { location: "none" };
+}
+
+function detectPurgeTargets(cwd: string): string[] {
+  const targets = new Set<string>();
+
+  if (existsSync(join(cwd, ".codedecay"))) {
+    targets.add(".codedecay");
+  }
+
+  for (const entry of readdirSync(cwd)) {
+    if (CODEDECAY_PURGE_FILE_PATTERN.test(entry)) {
+      targets.add(entry);
+    }
+  }
+
+  return [...targets].sort((left, right) => left.localeCompare(right));
+}
+
 function packageManagerInstallCommand(manager: PackageManager): Omit<UpdatePlan, "manager" | "source"> {
   switch (manager) {
     case "pnpm":
@@ -2606,6 +2905,38 @@ function packageManagerInstallCommand(manager: PackageManager): Omit<UpdatePlan,
         command: "npm",
         args: ["install", "-D", `${PACKAGE_NAME}@latest`],
         canApply: true
+      };
+  }
+}
+
+function packageManagerRemoveCommand(
+  manager: PackageManager
+): Pick<UninstallPlan, "displayCommand" | "command" | "args"> {
+  switch (manager) {
+    case "pnpm":
+      return {
+        displayCommand: `pnpm remove ${PACKAGE_NAME}`,
+        command: "pnpm",
+        args: ["remove", PACKAGE_NAME]
+      };
+    case "yarn":
+      return {
+        displayCommand: `yarn remove ${PACKAGE_NAME}`,
+        command: "yarn",
+        args: ["remove", PACKAGE_NAME]
+      };
+    case "bun":
+      return {
+        displayCommand: `bun remove ${PACKAGE_NAME}`,
+        command: "bun",
+        args: ["remove", PACKAGE_NAME]
+      };
+    case "npm":
+    default:
+      return {
+        displayCommand: `npm uninstall ${PACKAGE_NAME}`,
+        command: "npm",
+        args: ["uninstall", PACKAGE_NAME]
       };
   }
 }

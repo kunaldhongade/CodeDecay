@@ -127,6 +127,7 @@ npx codedecay analyze --base main --head HEAD --fail-on high
 | `codedecay help` | Show root or per-command help. |
 | `codedecay man` | Show a longer manual page for a command. |
 | `codedecay update` | Print or apply the recommended upgrade command. |
+| `codedecay uninstall` | Print or apply the recommended uninstall and cleanup plan. |
 | `codedecay version` | Print the installed CLI version. |
 
 Common flags:
@@ -156,6 +157,7 @@ codedecay help analyze
 codedecay man redteam
 codedecay version
 codedecay update
+codedecay uninstall --purge-local
 ```
 
 ## GitHub Action

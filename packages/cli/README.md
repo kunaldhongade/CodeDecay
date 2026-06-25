@@ -47,6 +47,7 @@ npx codedecay agent --profile codex --base main --head HEAD --format markdown
 | `codedecay help` | Show root or per-command help. |
 | `codedecay man` | Show a longer manual page for a command. |
 | `codedecay update` | Print or apply the recommended upgrade command. |
+| `codedecay uninstall` | Print or apply the recommended uninstall and cleanup plan. |
 | `codedecay version` | Print the installed CLI version. |
 
 Common flags:
@@ -69,6 +70,8 @@ codedecay man update
 codedecay version
 codedecay update
 codedecay update --apply
+codedecay uninstall --purge-local
+codedecay uninstall --purge-local --apply
 ```
 
 Reports are written to stdout by default. Relative `--output` paths resolve from
