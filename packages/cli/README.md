@@ -11,31 +11,15 @@ Optional LLM, agent, memory, and tool integrations are user-owned and explicit.
 
 ## Install
 
-Use the package manager your repository already uses:
-
 ```bash
 npm install -D @submux/codedecay
-pnpm add -D @submux/codedecay
-bun add -d @submux/codedecay
-yarn add -D @submux/codedecay
 ```
 
-For a no-install smoke test:
+Run with:
 
 ```bash
-npx -y @submux/codedecay --help
-```
-
-After a local install, run with `npx codedecay`, `pnpm codedecay`,
-`bunx codedecay`, or a package script.
-
-Do not run `npm install` inside a Bun, pnpm, or Yarn workspace that uses
-`workspace:*` dependencies. npm may fail before CodeDecay is installed. In Bun
-repos with `minimumReleaseAge`, a fresh CodeDecay release may also be blocked by
-repo policy; for local evaluation you can override it explicitly:
-
-```bash
-bun add -d @submux/codedecay --minimum-release-age 0
+npx codedecay --help
+npx codedecay man analyze
 ```
 
 ## Quickstart
@@ -60,6 +44,10 @@ npx codedecay agent --profile codex --base main --head HEAD --format markdown
 | `codedecay execute` | Run explicitly configured local checks and tool adapters. |
 | `codedecay differential` | Compare configured base/head behavior probes. |
 | `codedecay mcp` | Start the local MCP server. |
+| `codedecay help` | Show root or per-command help. |
+| `codedecay man` | Show a longer manual page for a command. |
+| `codedecay update` | Print or apply the recommended upgrade command. |
+| `codedecay version` | Print the installed CLI version. |
 
 Common flags:
 
@@ -71,6 +59,16 @@ Common flags:
 --output <path>
 --fail-on low|medium|high
 --profile generic|codex|claude-code|cursor|pi|opencode|desktop
+```
+
+Utility examples:
+
+```bash
+codedecay help analyze
+codedecay man update
+codedecay version
+codedecay update
+codedecay update --apply
 ```
 
 Reports are written to stdout by default. Relative `--output` paths resolve from

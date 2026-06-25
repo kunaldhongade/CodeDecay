@@ -210,11 +210,46 @@ describe("built codedecay CLI", () => {
     });
     expect(bundle.prompt).toContain("Target agent profile: OpenCode");
 
-    const help = runBuilt(["--help"]);
+    const help = runBuilt(["help", "agent"]);
 
     expect(help.status).toBe(0);
     expect(help.stdout).toContain("--profile <profile>");
     expect(help.stdout).toContain("generic, codex, claude-code, cursor, pi, opencode, desktop");
+  });
+
+  it("supports help, man, version, and update from the built CLI", () => {
+    const cwd = createTempDir();
+    writeFile(
+      cwd,
+      "package.json",
+      JSON.stringify(
+        {
+          name: "demo-repo",
+          private: true,
+          packageManager: "pnpm@11.8.0"
+        },
+        null,
+        2
+      )
+    );
+
+    const help = runBuilt(["help", "analyze"]);
+    expect(help.status).toBe(0);
+    expect(help.stdout).toContain("CodeDecay analyze");
+    expect(help.stdout).toContain("--fail-on <level>");
+
+    const manual = runBuilt(["man", "update"]);
+    expect(manual.status).toBe(0);
+    expect(manual.stdout).toContain("CODEDECAY-UPDATE(1)");
+
+    const version = runBuilt(["version"]);
+    expect(version.status).toBe(0);
+    expect(version.stdout.trim()).toBe(currentCliVersion());
+
+    const update = runBuilt(["update", "--cwd", cwd]);
+    expect(update.status).toBe(0);
+    expect(update.stdout).toContain("Package manager: pnpm (package.json#packageManager)");
+    expect(update.stdout).toContain("pnpm add -D @submux/codedecay@latest");
   });
 
   it("prints loaded config from the built CLI", () => {
@@ -551,6 +586,12 @@ function runBuilt(args: string[], path = cliPath): { status: number | null; stdo
     stdout: result.stdout,
     stderr: result.stderr
   };
+}
+
+function currentCliVersion(): string {
+  const packageJsonPath = join(repoRoot, "packages/cli/package.json");
+  const packageJson = JSON.parse(readFileSync(packageJsonPath, "utf8")) as { version: string };
+  return packageJson.version;
 }
 
 function createLowRiskRepo(): string {

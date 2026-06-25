@@ -1,5 +1,6 @@
-import { mkdirSync, realpathSync, writeFileSync } from "node:fs";
-import { dirname, resolve } from "node:path";
+import { spawnSync } from "node:child_process";
+import { existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
+import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   createConfiguredCommandAdapters,
@@ -86,6 +87,23 @@ interface RedteamOptions {
   format: RedteamFormat;
   output?: string | undefined;
   failOn?: RiskLevel | undefined;
+}
+
+type PackageManager = "npm" | "pnpm" | "yarn" | "bun";
+
+interface UpdateOptions {
+  cwd?: string | undefined;
+  manager?: PackageManager | undefined;
+  apply: boolean;
+}
+
+interface UpdatePlan {
+  manager?: PackageManager | undefined;
+  source: string;
+  displayCommand: string;
+  command: string;
+  args: string[];
+  canApply: boolean;
 }
 
 interface ExecutionReport {
@@ -186,12 +204,31 @@ interface CliAnalysisContext {
   loadedMemory: LoadedCodeDecayMemory;
 }
 
+interface HelpOptionDoc {
+  flag: string;
+  description: string;
+}
+
+interface CommandDoc {
+  name: string;
+  summary: string;
+  usage: string[];
+  description: string[];
+  options: HelpOptionDoc[];
+  examples: string[];
+  notes?: string[];
+}
+
 type CliCommandHandler = (context: CliCommandContext) => Promise<void> | void;
 type ConfigFormat = "json" | "markdown";
 
 const VALID_FORMATS = new Set<ReportFormat>(["json", "markdown", "sarif"]);
 const VALID_CONFIG_FORMATS = new Set<ConfigFormat>(["json", "markdown"]);
 const VALID_RISK_LEVELS = new Set<RiskLevel>(["low", "medium", "high"]);
+const VALID_PACKAGE_MANAGERS = new Set<PackageManager>(["npm", "pnpm", "yarn", "bun"]);
+const PACKAGE_NAME = "@submux/codedecay";
+const COMMAND_ORDER = ["analyze", "redteam", "agent", "config", "memory", "execute", "differential", "mcp"] as const;
+const UTILITY_COMMAND_ORDER = ["help", "man", "update", "version"] as const;
 
 class CliExit extends Error {
   constructor(readonly exitCode: number) {
@@ -200,6 +237,210 @@ class CliExit extends Error {
 }
 
 class HelpRequested extends Error {}
+
+const HELP_DOCS: Record<string, CommandDoc> = {
+  analyze: {
+    name: "analyze",
+    summary: "Deterministic PR risk, impact, and decay report.",
+    usage: ["codedecay analyze [options]"],
+    description: [
+      "Analyze the current working tree or a base/head git diff and report regression risk, blast radius, missing tests, and maintainability decay."
+    ],
+    options: [
+      { flag: "--base <ref>", description: "Base git ref to compare from" },
+      { flag: "--head <ref>", description: "Head git ref to compare to" },
+      { flag: "--cwd <path>", description: "Repository working directory (default: current directory)" },
+      { flag: "--format <format>", description: "json, markdown, or sarif (default: markdown)" },
+      { flag: "--output <path>", description: "Write report to a file instead of stdout" },
+      { flag: "--fail-on <level>", description: "Exit non-zero on low, medium, or high risk" }
+    ],
+    examples: [
+      "codedecay analyze --format markdown",
+      "codedecay analyze --base main --head HEAD --format json",
+      "codedecay analyze --format sarif --output codedecay.sarif"
+    ],
+    notes: [
+      "When --base/--head are omitted, CodeDecay analyzes the current git working tree.",
+      "Relative --output paths resolve from the analyzed repository root."
+    ]
+  },
+  redteam: {
+    name: "redteam",
+    summary: "Merge-safety report with impact, weak-test proof, edge cases, and fix tasks.",
+    usage: ["codedecay redteam [options]"],
+    description: [
+      "Produce a deterministic red-team review bundle that packages likely breakage paths, missing tests, edge cases, config context, and local skill context."
+    ],
+    options: [
+      { flag: "--base <ref>", description: "Base git ref to compare from" },
+      { flag: "--head <ref>", description: "Head git ref to compare to" },
+      { flag: "--cwd <path>", description: "Repository working directory (default: current directory)" },
+      { flag: "--format <format>", description: "json or markdown (default: markdown)" },
+      { flag: "--output <path>", description: "Write redteam report to a file instead of stdout" },
+      { flag: "--fail-on <level>", description: "Exit non-zero on low, medium, or high risk" }
+    ],
+    examples: [
+      "codedecay redteam --base main --head HEAD --format markdown",
+      "codedecay redteam --cwd ../my-repo --format json"
+    ],
+    notes: [
+      "Redteam reports do not execute configured commands or call LLMs by default.",
+      "Configured checks are described in the report as recommendations unless you run execute or differential explicitly."
+    ]
+  },
+  agent: {
+    name: "agent",
+    summary: "Task bundle for Codex, Claude Code, Cursor, Pi, OpenCode, desktop agents, or MCP clients.",
+    usage: ["codedecay agent [options]"],
+    description: [
+      "Generate an agent-facing task bundle from the same deterministic analysis and red-team context used by CodeDecay."
+    ],
+    options: [
+      { flag: "--base <ref>", description: "Base git ref to compare from" },
+      { flag: "--head <ref>", description: "Head git ref to compare to" },
+      { flag: "--cwd <path>", description: "Repository working directory (default: current directory)" },
+      { flag: "--format <format>", description: "json or markdown (default: markdown)" },
+      { flag: "--profile <profile>", description: `${AGENT_PROFILE_IDS.join(", ")} (default: generic)` },
+      { flag: "--output <path>", description: "Write agent task bundle to a file instead of stdout" }
+    ],
+    examples: [
+      "codedecay agent --profile codex --base main --head HEAD --format markdown",
+      "codedecay agent --cwd ../my-repo --profile opencode --format json"
+    ],
+    notes: [
+      "Agent bundles package evidence and instructions only. They do not trigger agent or model calls by themselves."
+    ]
+  },
+  config: {
+    name: "config",
+    summary: "Show normalized CodeDecay config.",
+    usage: ["codedecay config [options]"],
+    description: [
+      "Load repo-local CodeDecay config and render the normalized settings as JSON or markdown."
+    ],
+    options: [
+      { flag: "--cwd <path>", description: "Repository working directory (default: current directory)" },
+      { flag: "--format <format>", description: "json or markdown (default: json)" }
+    ],
+    examples: ["codedecay config --format markdown", "codedecay config --cwd ../my-repo --format json"]
+  },
+  memory: {
+    name: "memory",
+    summary: "Show local repo memory.",
+    usage: ["codedecay memory [options]"],
+    description: [
+      "Load `.codedecay/memory.json` and render the normalized memory sections used by redteam and agent workflows."
+    ],
+    options: [
+      { flag: "--cwd <path>", description: "Repository working directory (default: current directory)" },
+      { flag: "--format <format>", description: "json or markdown (default: json)" }
+    ],
+    examples: ["codedecay memory --format markdown", "codedecay memory --cwd ../my-repo --format json"]
+  },
+  execute: {
+    name: "execute",
+    summary: "Run explicitly configured local checks and tool adapters.",
+    usage: ["codedecay execute [options]"],
+    description: [
+      "Execute only the commands and tool adapters already declared in CodeDecay config, subject to the configured safety gates."
+    ],
+    options: [
+      { flag: "--cwd <path>", description: "Repository working directory (default: current directory)" },
+      { flag: "--format <format>", description: "json or markdown (default: markdown)" },
+      { flag: "--output <path>", description: "Write execution report to a file instead of stdout" }
+    ],
+    examples: ["codedecay execute --format markdown", "codedecay execute --cwd ../my-repo --format json"],
+    notes: [
+      "If `safety.allowCommands` is false, configured commands and adapters are reported as skipped instead of executed."
+    ]
+  },
+  differential: {
+    name: "differential",
+    summary: "Compare configured base/head behavior probes.",
+    usage: ["codedecay differential [options]"],
+    description: [
+      "Run configured probes against temporary worktrees for base and head refs, then report behavioral differences."
+    ],
+    options: [
+      { flag: "--base <ref>", description: "Base git ref to compare from (required)" },
+      { flag: "--head <ref>", description: "Head git ref to compare to (required)" },
+      { flag: "--cwd <path>", description: "Repository working directory (default: current directory)" },
+      { flag: "--format <format>", description: "json or markdown (default: markdown)" },
+      { flag: "--output <path>", description: "Write differential report to a file instead of stdout" }
+    ],
+    examples: [
+      "codedecay differential --base main --head HEAD --format markdown",
+      "codedecay differential --cwd ../my-repo --base origin/main --head HEAD --format json"
+    ],
+    notes: [
+      "Differential exits non-zero when probe behavior changes or infrastructure failures occur."
+    ]
+  },
+  mcp: {
+    name: "mcp",
+    summary: "Start the local MCP server.",
+    usage: ["codedecay mcp [options]"],
+    description: [
+      "Expose CodeDecay analysis capabilities through a local Model Context Protocol server for agent clients."
+    ],
+    options: [{ flag: "--cwd <path>", description: "Repository working directory exposed to MCP tools" }],
+    examples: ["codedecay mcp --cwd ../my-repo"]
+  },
+  help: {
+    name: "help",
+    summary: "Show root or per-command help.",
+    usage: ["codedecay help", "codedecay help <command>"],
+    description: [
+      "Print concise usage documentation for the whole CLI or for a specific command."
+    ],
+    options: [],
+    examples: ["codedecay help", "codedecay help analyze"],
+    notes: [
+      "`codedecay <command> --help` prints the same command-specific help text."
+    ]
+  },
+  man: {
+    name: "man",
+    summary: "Show a longer manual page.",
+    usage: ["codedecay man", "codedecay man <command>"],
+    description: [
+      "Print a fuller manual view with command descriptions, options, examples, and operational notes."
+    ],
+    options: [],
+    examples: ["codedecay man", "codedecay man redteam"]
+  },
+  update: {
+    name: "update",
+    summary: "Print or apply the recommended CLI upgrade command.",
+    usage: ["codedecay update [options]"],
+    description: [
+      "Detect the repository package manager and print the safest upgrade command for `@submux/codedecay`. By default this is a dry run."
+    ],
+    options: [
+      { flag: "--cwd <path>", description: "Working directory used for package-manager detection" },
+      { flag: "--manager <name>", description: "Override detection with npm, pnpm, yarn, or bun" },
+      { flag: "--apply", description: "Execute the recommended upgrade command instead of only printing it" }
+    ],
+    examples: [
+      "codedecay update",
+      "codedecay update --cwd ../my-repo",
+      "codedecay update --manager pnpm --apply"
+    ],
+    notes: [
+      "Update never executes automatically. You must pass --apply to run the package-manager command."
+    ]
+  },
+  version: {
+    name: "version",
+    summary: "Print the installed CodeDecay version.",
+    usage: ["codedecay version", "codedecay --version"],
+    description: [
+      "Print the CLI version bundled into the current CodeDecay build."
+    ],
+    options: [],
+    examples: ["codedecay version", "codedecay --version"]
+  }
+};
 
 const COMMAND_HANDLERS: Record<string, CliCommandHandler> = {
   agent: runAgentCommand,
@@ -240,22 +481,73 @@ export async function runCli(args: string[], runtime: CliRuntime = {}): Promise<
 
 async function run(args: string[], runtime: CliRuntime): Promise<void | number> {
   const [command, ...commandArgs] = args;
+  const runtimeCwd = runtime.cwd ?? process.cwd();
 
   if (!command || command === "--help" || command === "-h") {
     printHelp(runtime);
     return;
   }
 
+  if (command === "help") {
+    const topic = commandArgs[0];
+    printHelp(runtime, topic === "--help" || topic === "-h" ? undefined : topic);
+    return;
+  }
+
+  if (command === "--version" || command === "-V" || command === "version") {
+    if (commandArgs.includes("--help") || commandArgs.includes("-h")) {
+      printHelp(runtime, "version");
+      return;
+    }
+
+    runVersionCommand(runtime);
+    return;
+  }
+
+  if (command === "man") {
+    const topic = commandArgs[0];
+    if (topic === "--help" || topic === "-h") {
+      printHelp(runtime, "man");
+      return;
+    }
+
+    printManual(runtime, topic);
+    return;
+  }
+
+  if (command === "update") {
+    if (commandArgs.includes("--help") || commandArgs.includes("-h")) {
+      printHelp(runtime, "update");
+      return;
+    }
+
+    await runUpdateCommand({
+      args: commandArgs,
+      runtime,
+      runtimeCwd
+    });
+    return;
+  }
+
+  if (commandArgs.includes("--help") || commandArgs.includes("-h")) {
+    printHelp(runtime, command);
+    return;
+  }
+
   const handler = COMMAND_HANDLERS[command];
   if (!handler) {
-    throw new Error(`Unknown command: ${command}`);
+    throw new Error(`Unknown command: ${command}. Run "codedecay help" for available commands.`);
   }
 
   await handler({
     args: commandArgs,
     runtime,
-    runtimeCwd: runtime.cwd ?? process.cwd()
+    runtimeCwd
   });
+}
+
+function runVersionCommand(runtime: CliRuntime): void {
+  printVersion(runtime);
 }
 
 function runConfigCommand(context: CliCommandContext): void {
@@ -263,6 +555,38 @@ function runConfigCommand(context: CliCommandContext): void {
   const cwd = resolve(context.runtimeCwd, options.cwd ?? ".");
   const loadedConfig = loadCodeDecayConfig({ cwd });
   write(context.runtime.stdout, renderConfig(loadedConfig, options.format));
+}
+
+async function runUpdateCommand(context: CliCommandContext): Promise<void> {
+  const options = parseUpdateArgs(context.args);
+  const cwd = resolve(context.runtimeCwd, options.cwd ?? ".");
+  const plan = createUpdatePlan(cwd, options);
+
+  writeStdout(
+    context.runtime,
+    renderUpdatePlan({
+      cwd,
+      plan,
+      apply: options.apply
+    })
+  );
+
+  if (!options.apply) {
+    return;
+  }
+
+  if (!plan.canApply) {
+    throw new Error('No local package manager command can be applied automatically. Run "codedecay update" for guidance.');
+  }
+
+  const result = spawnSync(plan.command, plan.args, {
+    cwd,
+    stdio: "inherit"
+  });
+
+  if (result.status !== 0) {
+    throw new CliExit(result.status ?? 1);
+  }
 }
 
 async function runMcpCommand(context: CliCommandContext): Promise<void> {
@@ -480,6 +804,55 @@ function parseMcpArgs(args: string[]): McpOptions {
 
     if (arg === "--cwd") {
       options.cwd = requireValue(args, index, arg);
+      index += 1;
+      continue;
+    }
+
+    throw new Error(`Unknown option: ${arg}`);
+  }
+
+  return options;
+}
+
+function parseUpdateArgs(args: string[]): UpdateOptions {
+  const options: UpdateOptions = {
+    apply: false
+  };
+
+  for (let index = 0; index < args.length; index += 1) {
+    const arg = args[index];
+
+    if (!arg) {
+      continue;
+    }
+
+    if (arg === "--help" || arg === "-h") {
+      throw new HelpRequested();
+    }
+
+    if (arg === "--apply") {
+      options.apply = true;
+      continue;
+    }
+
+    if (arg.startsWith("--cwd=")) {
+      options.cwd = arg.slice("--cwd=".length);
+      continue;
+    }
+
+    if (arg === "--cwd") {
+      options.cwd = requireValue(args, index, arg);
+      index += 1;
+      continue;
+    }
+
+    if (arg.startsWith("--manager=")) {
+      options.manager = parsePackageManager(arg.slice("--manager=".length));
+      continue;
+    }
+
+    if (arg === "--manager") {
+      options.manager = parsePackageManager(requireValue(args, index, arg));
       index += 1;
       continue;
     }
@@ -982,6 +1355,14 @@ function parseRiskLevel(value: string): RiskLevel {
   }
 
   throw new Error(`Invalid risk level "${value}". Expected low, medium, or high.`);
+}
+
+function parsePackageManager(value: string): PackageManager {
+  if (VALID_PACKAGE_MANAGERS.has(value as PackageManager)) {
+    return value as PackageManager;
+  }
+
+  throw new Error(`Invalid package manager "${value}". Expected npm, pnpm, yarn, or bun.`);
 }
 
 function requireValue(args: string[], index: number, flag: string): string {
@@ -1774,82 +2155,343 @@ function findUnresolvedRef(message: string, options: AnalyzeOptions): string | u
   return undefined;
 }
 
-function printHelp(runtime: CliRuntime): void {
-  writeStdout(runtime, `CodeDecay
+function printHelp(runtime: CliRuntime, topic?: string): void {
+  if (!topic) {
+    writeStdout(runtime, renderRootHelp());
+    return;
+  }
 
-Usage:
-  codedecay agent [options]
-  codedecay analyze [options]
-  codedecay config [options]
-  codedecay memory [options]
-  codedecay execute [options]
-  codedecay differential [options]
-  codedecay redteam [options]
-  codedecay mcp [options]
+  writeStdout(runtime, renderCommandHelp(resolveHelpTopic(topic)));
+}
 
-Options:
-  --base <ref>               Base git ref to compare from
-  --head <ref>               Head git ref to compare to
-  --cwd <path>               Repository working directory (default: current directory)
-  --format <format>          json, markdown, or sarif (default: markdown)
-  --output <path>            Write report to a file instead of stdout
-  --fail-on <level>          Exit non-zero on low, medium, or high risk
-  -h, --help                 Show help
+function printManual(runtime: CliRuntime, topic?: string): void {
+  if (!topic) {
+    writeStdout(runtime, renderRootManual());
+    return;
+  }
 
-Agent Options:
-  --base <ref>               Base git ref to compare from
-  --head <ref>               Head git ref to compare to
-  --cwd <path>               Repository working directory (default: current directory)
-  --format <format>          json or markdown (default: markdown)
-  --profile <profile>        ${AGENT_PROFILE_IDS.join(", ")} (default: generic)
-  --output <path>            Write agent task bundle to a file instead of stdout
+  writeStdout(runtime, renderCommandManual(resolveHelpTopic(topic)));
+}
 
-Config Options:
-  --cwd <path>               Repository working directory (default: current directory)
-  --format <format>          json or markdown (default: json)
+function printVersion(runtime: CliRuntime): void {
+  writeStdout(runtime, `${CODEDECAY_VERSION}\n`);
+}
 
-Memory Options:
-  --cwd <path>               Repository working directory (default: current directory)
-  --format <format>          json or markdown (default: json)
+function resolveHelpTopic(topic: string): CommandDoc {
+  const doc = HELP_DOCS[topic];
+  if (doc) {
+    return doc;
+  }
 
-Execution Options:
-  --cwd <path>               Repository working directory (default: current directory)
-  --format <format>          json or markdown (default: markdown)
-  --output <path>            Write execution report to a file instead of stdout
+  throw new Error(`Unknown command: ${topic}. Run "codedecay help" for available commands.`);
+}
 
-Differential Options:
-  --base <ref>               Base git ref to compare from (required)
-  --head <ref>               Head git ref to compare to (required)
-  --cwd <path>               Repository working directory (default: current directory)
-  --format <format>          json or markdown (default: markdown)
-  --output <path>            Write differential report to a file instead of stdout
+function renderRootHelp(): string {
+  const lines = [
+    "CodeDecay",
+    "",
+    "Find what your coding agent missed before merge.",
+    "",
+    "Usage:",
+    "  codedecay <command> [options]",
+    "  codedecay help [command]",
+    "  codedecay man [command]",
+    "  codedecay update [options]",
+    "  codedecay version",
+    "",
+    "Commands:"
+  ];
 
-Redteam Options:
-  --base <ref>               Base git ref to compare from
-  --head <ref>               Head git ref to compare to
-  --cwd <path>               Repository working directory (default: current directory)
-  --format <format>          json or markdown (default: markdown)
-  --output <path>            Write redteam report to a file instead of stdout
-  --fail-on <level>          Exit non-zero on low, medium, or high risk
+  appendCommandSummaries(lines, COMMAND_ORDER);
 
-MCP Options:
-  --cwd <path>               Repository working directory exposed to MCP tools
+  lines.push("", "Utilities:");
+  appendCommandSummaries(lines, UTILITY_COMMAND_ORDER);
 
-Examples:
-  codedecay agent --base main --head HEAD --format markdown
-  codedecay agent --profile codex --format markdown
-  codedecay agent --cwd ../my-repo --format json --output codedecay-agent.json
-  codedecay analyze --base main --head HEAD --format markdown
-  codedecay analyze --cwd ../my-repo --format json
-  codedecay analyze --format sarif --output codedecay.sarif
-  codedecay analyze --fail-on high
-  codedecay config --cwd ../my-repo --format markdown
-  codedecay memory --cwd ../my-repo --format markdown
-  codedecay execute --cwd ../my-repo --format markdown
-  codedecay differential --base main --head HEAD --format markdown
-  codedecay redteam --base main --head HEAD --format markdown
-  codedecay mcp --cwd ../my-repo
-`);
+  lines.push(
+    "",
+    "Global flags:",
+    "  -h, --help                 Show help",
+    "  -V, --version              Print the installed CodeDecay version",
+    "",
+    "Examples:",
+    "  codedecay analyze --base main --head HEAD --format markdown",
+    "  codedecay redteam --base main --head HEAD --format markdown",
+    "  codedecay agent --profile codex --format markdown",
+    "  codedecay help analyze",
+    "  codedecay man update",
+    "",
+    'Run "codedecay help <command>" for command-specific flags.'
+  );
+
+  return `${lines.join("\n")}\n`;
+}
+
+function renderCommandHelp(doc: CommandDoc): string {
+  const lines = [
+    `CodeDecay ${doc.name}`,
+    "",
+    `${doc.summary}`,
+    "",
+    "Usage:"
+  ];
+
+  for (const usage of doc.usage) {
+    lines.push(`  ${usage}`);
+  }
+
+  if (doc.description.length > 0) {
+    lines.push("", "Description:");
+    for (const paragraph of doc.description) {
+      lines.push(`  ${paragraph}`);
+    }
+  }
+
+  if (doc.options.length > 0) {
+    lines.push("", "Options:");
+    appendOptionDocs(lines, doc.options);
+  }
+
+  if (doc.examples.length > 0) {
+    lines.push("", "Examples:");
+    for (const example of doc.examples) {
+      lines.push(`  ${example}`);
+    }
+  }
+
+  if (doc.notes && doc.notes.length > 0) {
+    lines.push("", "Notes:");
+    for (const note of doc.notes) {
+      lines.push(`  - ${note}`);
+    }
+  }
+
+  return `${lines.join("\n")}\n`;
+}
+
+function renderRootManual(): string {
+  const lines = [
+    "CODEDECAY(1)",
+    "",
+    "NAME",
+    "  codedecay - deterministic PR regression-risk and code-decay CLI",
+    "",
+    "SYNOPSIS",
+    "  codedecay <command> [options]",
+    "",
+    "DESCRIPTION",
+    "  CodeDecay is a local-first CLI for regression-risk analysis, blast-radius mapping, maintainability decay detection, weak-test auditing, and agent handoff workflows.",
+    "  It does not require hosted services or hidden model calls to produce the core analysis.",
+    "",
+    "DISCOVERY",
+    "  codedecay help <command>   Show concise command help",
+    "  codedecay man <command>    Show a longer command manual",
+    "  codedecay version          Print the installed version",
+    "  codedecay update           Print the recommended upgrade command",
+    "",
+    "COMMANDS"
+  ];
+
+  appendCommandSummaries(lines, COMMAND_ORDER);
+
+  lines.push("", "UTILITIES");
+  appendCommandSummaries(lines, UTILITY_COMMAND_ORDER);
+
+  lines.push(
+    "",
+    "SAFETY",
+    "  CodeDecay does not execute project commands unless they are explicitly configured and allowed by repo-local safety settings.",
+    "  Redteam and agent workflows package evidence and recommendations without executing configured checks by default.",
+    ""
+  );
+
+  return `${lines.join("\n")}\n`;
+}
+
+function renderCommandManual(doc: CommandDoc): string {
+  const lines = [
+    `CODEDECAY-${doc.name.toUpperCase()}(1)`,
+    "",
+    "NAME",
+    `  codedecay ${doc.name} - ${doc.summary.toLowerCase()}`,
+    "",
+    "SYNOPSIS"
+  ];
+
+  for (const usage of doc.usage) {
+    lines.push(`  ${usage}`);
+  }
+
+  if (doc.description.length > 0) {
+    lines.push("", "DESCRIPTION");
+    for (const paragraph of doc.description) {
+      lines.push(`  ${paragraph}`);
+    }
+  }
+
+  if (doc.options.length > 0) {
+    lines.push("", "OPTIONS");
+    appendOptionDocs(lines, doc.options);
+  }
+
+  if (doc.examples.length > 0) {
+    lines.push("", "EXAMPLES");
+    for (const example of doc.examples) {
+      lines.push(`  ${example}`);
+    }
+  }
+
+  if (doc.notes && doc.notes.length > 0) {
+    lines.push("", "NOTES");
+    for (const note of doc.notes) {
+      lines.push(`  - ${note}`);
+    }
+  }
+
+  return `${lines.join("\n")}\n`;
+}
+
+function appendCommandSummaries(lines: string[], commands: readonly string[]): void {
+  for (const command of commands) {
+    const doc = resolveHelpTopic(command);
+    lines.push(`  ${doc.name.padEnd(12)} ${doc.summary}`);
+  }
+}
+
+function appendOptionDocs(lines: string[], options: HelpOptionDoc[]): void {
+  const width = Math.max(...options.map((option) => option.flag.length), 0);
+  for (const option of options) {
+    lines.push(`  ${option.flag.padEnd(width)}   ${option.description}`);
+  }
+}
+
+function createUpdatePlan(cwd: string, options: UpdateOptions): UpdatePlan {
+  const detection = options.manager ? { manager: options.manager, source: "override" } : detectPackageManager(cwd);
+  const manager = detection?.manager;
+
+  if (!manager) {
+    return {
+      source: "none",
+      displayCommand: `npx -y ${PACKAGE_NAME}@latest --help`,
+      command: "npx",
+      args: ["-y", `${PACKAGE_NAME}@latest`, "--help"],
+      canApply: false
+    };
+  }
+
+  return {
+    manager,
+    source: detection?.source ?? "default",
+    ...packageManagerInstallCommand(manager)
+  };
+}
+
+function renderUpdatePlan(input: { cwd: string; plan: UpdatePlan; apply: boolean }): string {
+  const lines = [
+    "CodeDecay update",
+    "",
+    `Current CLI version: ${CODEDECAY_VERSION}`,
+    `Working directory: ${input.cwd}`
+  ];
+
+  if (input.plan.manager) {
+    lines.push(`Package manager: ${input.plan.manager} (${input.plan.source})`);
+  } else {
+    lines.push("Package manager: not detected");
+  }
+
+  lines.push("", "Recommended command:", `  ${input.plan.displayCommand}`);
+
+  if (input.apply) {
+    lines.push("");
+    if (input.plan.canApply) {
+      lines.push("Applying update command...");
+    } else {
+      lines.push("Automatic apply is unavailable for this update plan.");
+    }
+  } else {
+    lines.push("", 'Run "codedecay update --apply" to execute it automatically.');
+  }
+
+  return `${lines.join("\n")}\n`;
+}
+
+function detectPackageManager(cwd: string): { manager: PackageManager; source: string } | undefined {
+  const packageJsonPath = join(cwd, "package.json");
+
+  if (existsSync(packageJsonPath)) {
+    try {
+      const parsed = JSON.parse(readFileSync(packageJsonPath, "utf8")) as { packageManager?: string | undefined };
+      const configured = normalizePackageManager(parsed.packageManager);
+      if (configured) {
+        return { manager: configured, source: "package.json#packageManager" };
+      }
+    } catch {
+      // Ignore unreadable package.json for manager detection.
+    }
+  }
+
+  const lockfiles: Array<[string, PackageManager]> = [
+    ["pnpm-lock.yaml", "pnpm"],
+    ["bun.lock", "bun"],
+    ["bun.lockb", "bun"],
+    ["yarn.lock", "yarn"],
+    ["package-lock.json", "npm"]
+  ];
+
+  for (const [filename, manager] of lockfiles) {
+    if (existsSync(join(cwd, filename))) {
+      return { manager, source: filename };
+    }
+  }
+
+  if (existsSync(packageJsonPath)) {
+    return { manager: "npm", source: "package.json (default)" };
+  }
+
+  return undefined;
+}
+
+function normalizePackageManager(value: string | undefined): PackageManager | undefined {
+  if (!value) {
+    return undefined;
+  }
+
+  const normalized = value.split("@", 1)[0];
+  return VALID_PACKAGE_MANAGERS.has(normalized as PackageManager) ? (normalized as PackageManager) : undefined;
+}
+
+function packageManagerInstallCommand(manager: PackageManager): Omit<UpdatePlan, "manager" | "source"> {
+  switch (manager) {
+    case "pnpm":
+      return {
+        displayCommand: `pnpm add -D ${PACKAGE_NAME}@latest`,
+        command: "pnpm",
+        args: ["add", "-D", `${PACKAGE_NAME}@latest`],
+        canApply: true
+      };
+    case "yarn":
+      return {
+        displayCommand: `yarn add -D ${PACKAGE_NAME}@latest`,
+        command: "yarn",
+        args: ["add", "-D", `${PACKAGE_NAME}@latest`],
+        canApply: true
+      };
+    case "bun":
+      return {
+        displayCommand: `bun add -d ${PACKAGE_NAME}@latest`,
+        command: "bun",
+        args: ["add", "-d", `${PACKAGE_NAME}@latest`],
+        canApply: true
+      };
+    case "npm":
+    default:
+      return {
+        displayCommand: `npm install -D ${PACKAGE_NAME}@latest`,
+        command: "npm",
+        args: ["install", "-D", `${PACKAGE_NAME}@latest`],
+        canApply: true
+      };
+  }
 }
 
 function write(writer: ((text: string) => void) | undefined, text: string): void {

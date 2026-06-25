@@ -56,31 +56,14 @@ is treated as suggestions, not trusted proof.
 
 ## Install
 
-Use the package manager your repository already uses:
-
 ```bash
 npm install -D @submux/codedecay
-pnpm add -D @submux/codedecay
-bun add -d @submux/codedecay
-yarn add -D @submux/codedecay
 ```
 
-For a no-install smoke test:
+Run it with `npx codedecay` or add it to an npm script.
 
 ```bash
-npx -y @submux/codedecay --help
-```
-
-After a local install, run it with `npx codedecay`, `pnpm codedecay`,
-`bunx codedecay`, or add `codedecay` to a package script.
-
-Do not run `npm install` inside a Bun, pnpm, or Yarn workspace that uses
-`workspace:*` dependencies. npm may fail before CodeDecay is installed. In Bun
-repos with `minimumReleaseAge`, a fresh CodeDecay release may also be blocked by
-repo policy; for local evaluation you can override it explicitly:
-
-```bash
-bun add -d @submux/codedecay --minimum-release-age 0
+npx codedecay --help
 ```
 
 For source checkout development:
@@ -141,6 +124,10 @@ npx codedecay analyze --base main --head HEAD --fail-on high
 | `codedecay execute` | Run explicitly configured local commands and OSS tool adapters. |
 | `codedecay differential` | Run configured probes on base and head and compare behavior. |
 | `codedecay mcp` | Start a local MCP server for agent clients. |
+| `codedecay help` | Show root or per-command help. |
+| `codedecay man` | Show a longer manual page for a command. |
+| `codedecay update` | Print or apply the recommended upgrade command. |
+| `codedecay version` | Print the installed CLI version. |
 
 Common flags:
 
@@ -161,6 +148,15 @@ Exit codes:
 | `0` | Command succeeded and risk is below `--fail-on`, if provided. |
 | `1` | Analysis succeeded but risk met the `--fail-on` threshold, or configured execution checks failed. |
 | `2` | CLI/internal error, invalid git refs, invalid config, or non-git directory. |
+
+Utility examples:
+
+```bash
+codedecay help analyze
+codedecay man redteam
+codedecay version
+codedecay update
+```
 
 ## GitHub Action
 
@@ -368,6 +364,12 @@ the same Markdown files for humans and generates agent-friendly outputs at
 
 - Local docs dev server: `pnpm docs:dev`
 - Static docs build: `pnpm docs:build`
+- GitHub wiki sync: `pnpm docs:wiki:sync`
+
+The repo also tracks a thin companion wiki index in `.github/wiki/`. GitHub
+only provisions the wiki git remote after the first page is created once in the
+repository's Wiki tab. After that one-time bootstrap, `pnpm docs:wiki:sync`
+keeps the wiki `Home` and sidebar aligned with the docs site.
 
 - [Getting started](docs/getting-started.md)
 - [Configuration](docs/configuration.md)

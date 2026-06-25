@@ -1,3 +1,4 @@
+import { execFileSync } from "node:child_process";
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { readdirSync, statSync } from "node:fs";
 import { dirname, join, relative } from "node:path";
@@ -8,9 +9,12 @@ const publicRoot = join(docsRoot, "public");
 const markdownRoot = join(publicRoot, "markdown");
 const llmsPath = join(publicRoot, "llms.txt");
 const llmsFullPath = join(publicRoot, "llms-full.txt");
+const wikiRoot = join(repoRoot, ".github", "wiki");
+const wikiHomePath = join(wikiRoot, "Home.md");
+const wikiSidebarPath = join(wikiRoot, "_Sidebar.md");
 
 const docsBase = normalizeBase(process.env.DOCS_BASE ?? "/");
-const siteUrl = normalizeSiteUrl(process.env.DOCS_SITE_URL);
+const siteUrl = normalizeSiteUrl(process.env.DOCS_SITE_URL ?? detectDefaultSiteUrl());
 
 const orderedPages = [
   "index.md",
@@ -74,6 +78,7 @@ generate();
 function generate() {
   rmSync(markdownRoot, { recursive: true, force: true });
   mkdirSync(markdownRoot, { recursive: true });
+  mkdirSync(wikiRoot, { recursive: true });
 
   const discovered = discoverMarkdownFiles(docsRoot);
   const pageOrder = orderedPages.filter((path) => discovered.has(path));
@@ -88,6 +93,8 @@ function generate() {
 
   writeFileSync(llmsPath, renderLlmsIndex(pages), "utf8");
   writeFileSync(llmsFullPath, renderLlmsFull(pages), "utf8");
+  writeFileSync(wikiHomePath, renderWikiHome(pages), "utf8");
+  writeFileSync(wikiSidebarPath, renderWikiSidebar(pages), "utf8");
 }
 
 function discoverMarkdownFiles(root) {
@@ -208,6 +215,73 @@ function renderLlmsFull(pages) {
   return `${lines.join("\n").trim()}\n`;
 }
 
+function renderWikiHome(pages) {
+  const pageByPath = new Map(pages.map((page) => [page.path, page]));
+  const docsHome = getRequiredPage(pageByPath, "index.md");
+  const gettingStarted = getRequiredPage(pageByPath, "getting-started.md");
+  const githubAction = getRequiredPage(pageByPath, "github-action.md");
+  const configuration = getRequiredPage(pageByPath, "configuration.md");
+  const sampleReports = getRequiredPage(pageByPath, "sample-reports/index.md");
+
+  const lines = [
+    "# CodeDecay Wiki",
+    "",
+    "This wiki is a lightweight index for the main CodeDecay documentation site.",
+    "",
+    "Use the docs site for full navigation, search, and deploy-ready static pages. Use the raw endpoints when you want direct retrieval for agents and automation.",
+    "",
+    "## Primary Docs",
+    "",
+    `- [Docs Home](${docsHome.pageUrl})`,
+    `- [Getting Started](${gettingStarted.pageUrl})`,
+    `- [GitHub Action](${githubAction.pageUrl})`,
+    `- [Configuration](${configuration.pageUrl})`,
+    `- [Sample Reports](${sampleReports.pageUrl})`,
+    "",
+    "## Agent-Friendly Endpoints",
+    "",
+    `- [llms.txt](${withSiteUrl("/llms.txt")})`,
+    `- [llms-full.txt](${withSiteUrl("/llms-full.txt")})`,
+    `- [Docs Home Markdown](${docsHome.markdownUrl})`,
+    `- [Getting Started Markdown](${gettingStarted.markdownUrl})`
+  ];
+
+  return `${lines.join("\n").trim()}\n`;
+}
+
+function renderWikiSidebar(pages) {
+  const pageByPath = new Map(pages.map((page) => [page.path, page]));
+  const docsHome = getRequiredPage(pageByPath, "index.md");
+  const gettingStarted = getRequiredPage(pageByPath, "getting-started.md");
+  const githubAction = getRequiredPage(pageByPath, "github-action.md");
+  const configuration = getRequiredPage(pageByPath, "configuration.md");
+  const sampleReports = getRequiredPage(pageByPath, "sample-reports/index.md");
+
+  const lines = [
+    "# CodeDecay",
+    "",
+    "- [Home](Home)",
+    `- [Docs Home](${docsHome.pageUrl})`,
+    `- [Getting Started](${gettingStarted.pageUrl})`,
+    `- [GitHub Action](${githubAction.pageUrl})`,
+    `- [Configuration](${configuration.pageUrl})`,
+    `- [Sample Reports](${sampleReports.pageUrl})`,
+    `- [llms.txt](${withSiteUrl("/llms.txt")})`,
+    `- [llms-full.txt](${withSiteUrl("/llms-full.txt")})`
+  ];
+
+  return `${lines.join("\n").trim()}\n`;
+}
+
+function getRequiredPage(pageByPath, path) {
+  const page = pageByPath.get(path);
+  if (!page) {
+    throw new Error(`Expected docs page "${path}" to exist while generating wiki artifacts.`);
+  }
+
+  return page;
+}
+
 function groupBySection(pages) {
   const grouped = new Map();
 
@@ -283,6 +357,34 @@ function normalizeSiteUrl(value) {
   }
 
   return value.endsWith("/") ? value.slice(0, -1) : value;
+}
+
+function detectDefaultSiteUrl() {
+  const repository = process.env.GITHUB_REPOSITORY ?? detectRepositoryFromGit();
+  if (!repository) {
+    return "";
+  }
+
+  const [owner, repo] = repository.split("/");
+  if (!owner || !repo) {
+    return "";
+  }
+
+  return `https://${owner.toLowerCase()}.github.io/${repo}`;
+}
+
+function detectRepositoryFromGit() {
+  try {
+    const remoteUrl = execFileSync("git", ["config", "--get", "remote.origin.url"], {
+      cwd: repoRoot,
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"]
+    }).trim();
+    const match = remoteUrl.match(/[:/]([^/]+\/[^/]+?)(?:\.git)?$/);
+    return match?.[1] ?? "";
+  } catch {
+    return "";
+  }
 }
 
 function withSiteUrl(path) {

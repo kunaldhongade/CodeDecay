@@ -195,6 +195,59 @@ describe("codedecay analyze CLI contract", () => {
   });
 });
 
+describe("codedecay CLI discovery commands", () => {
+  it("prints root help, command help, and manual pages", async () => {
+    const cwd = createTempDir();
+
+    const rootHelp = await run(["help"], cwd);
+    expect(rootHelp.exitCode).toBe(0);
+    expect(rootHelp.stdout).toContain("codedecay help [command]");
+    expect(rootHelp.stdout).toContain("update");
+
+    const commandHelp = await run(["help", "analyze"], cwd);
+    expect(commandHelp.exitCode).toBe(0);
+    expect(commandHelp.stdout).toContain("CodeDecay analyze");
+    expect(commandHelp.stdout).toContain("--fail-on <level>");
+
+    const inlineHelp = await run(["analyze", "--help"], cwd);
+    expect(inlineHelp.exitCode).toBe(0);
+    expect(inlineHelp.stdout).toContain("CodeDecay analyze");
+    expect(inlineHelp.stdout).toContain("codedecay analyze [options]");
+
+    const manual = await run(["man", "update"], cwd);
+    expect(manual.exitCode).toBe(0);
+    expect(manual.stdout).toContain("CODEDECAY-UPDATE(1)");
+    expect(manual.stdout).toContain("OPTIONS");
+  });
+
+  it("prints version and update guidance", async () => {
+    const cwd = createTempDir();
+    writeFile(
+      cwd,
+      "package.json",
+      JSON.stringify(
+        {
+          name: "demo-repo",
+          private: true,
+          packageManager: "pnpm@11.8.0"
+        },
+        null,
+        2
+      )
+    );
+
+    const version = await run(["version"], cwd);
+    expect(version.exitCode).toBe(0);
+    expect(version.stdout.trim()).toBe(currentCliVersion());
+
+    const update = await run(["update"], cwd);
+    expect(update.exitCode).toBe(0);
+    expect(update.stdout).toContain("Package manager: pnpm (package.json#packageManager)");
+    expect(update.stdout).toContain("pnpm add -D @submux/codedecay@latest");
+    expect(update.stdout).toContain('Run "codedecay update --apply" to execute it automatically.');
+  });
+});
+
 describe("codedecay config CLI contract", () => {
   it("prints safe defaults when config is missing", async () => {
     const cwd = createTempDir();
@@ -1042,6 +1095,12 @@ function stableReport(output: string): unknown {
   const report = JSON.parse(output);
   delete report.generatedAt;
   return report;
+}
+
+function currentCliVersion(): string {
+  const packageJsonPath = join(process.cwd(), "packages/cli/package.json");
+  const packageJson = JSON.parse(readFileSync(packageJsonPath, "utf8")) as { version: string };
+  return packageJson.version;
 }
 
 function createLowRiskRepo(): string {
