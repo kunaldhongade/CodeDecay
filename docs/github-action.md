@@ -55,6 +55,28 @@ packages/web` and `output: codedecay.sarif`, the SARIF file is written to
 The MVP action writes a markdown summary to `$GITHUB_STEP_SUMMARY`. SARIF upload
 can be added by the workflow using GitHub's code scanning upload action.
 
+## Trend Snapshot Artifacts
+
+The composite action focuses on `analyze`, `redteam`, and `agent`. For trend
+snapshots, call the CLI directly in the workflow and upload the artifact:
+
+```yaml
+- run: pnpm exec codedecay snapshot --base "${{ github.event.pull_request.base.sha }}" --head "${{ github.event.pull_request.head.sha }}" --format json --output codedecay-snapshot.json
+- uses: actions/upload-artifact@v4
+  with:
+    name: codedecay-snapshot
+    path: codedecay-snapshot.json
+```
+
+To compare against a saved snapshot:
+
+```yaml
+- run: pnpm exec codedecay snapshot --base "${{ github.event.pull_request.base.sha }}" --head "${{ github.event.pull_request.head.sha }}" --compare .codedecay/previous-snapshot.json --format markdown
+```
+
+See [Trend snapshots](trend-snapshots.md) for a fuller artifact and history
+workflow.
+
 ## Redteam And Agent Modes
 
 The action can also run report-only redteam and agent bundle modes. Redteam

@@ -115,7 +115,7 @@ describe("redteam report", () => {
 
     const markdown = renderRedteamReport(report, "markdown");
     expect(markdown).toContain("## CodeDecay Redteam Report");
-    expect(markdown).toContain("### Test Proof Audit");
+    expect(markdown).toContain("### Test Evidence Audit");
     expect(markdown).toContain("| Missing-test findings | 0 |");
     expect(markdown).toContain("**Status:** Weak");
     expect(markdown).toContain("### Agent Skills");

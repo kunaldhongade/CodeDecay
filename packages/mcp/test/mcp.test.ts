@@ -166,7 +166,7 @@ describe("CodeDecay MCP tools", () => {
     const output = runRedteamReportTool({ cwd: repo }, { format: "markdown" });
 
     expect(output).toContain("## CodeDecay Redteam Report");
-    expect(output).toContain("### Test Proof Audit");
+    expect(output).toContain("### Test Evidence Audit");
     expect(output).toContain("Changed test has no assertions");
     expect(output).toContain("LLM/model called: no");
   });

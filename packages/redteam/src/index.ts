@@ -571,16 +571,18 @@ function appendImpactedRoutes(lines: string[], routes: ImpactedRoute[]): void {
     }
 
     if (route.recommendedTests.length > 0) {
-      lines.push(`  - Suggested proof: ${route.recommendedTests[0]}`);
+      lines.push(`  - Suggested evidence: ${route.recommendedTests[0]}`);
     }
   }
   lines.push("");
 }
 
 function appendTestAudit(lines: string[], audit: TestProofAudit): void {
-  lines.push("### Test Proof Audit", "");
+  lines.push("### Test Evidence Audit", "");
   lines.push(`**Status:** ${formatTestProofStatus(audit.status)}`);
   lines.push(`**Summary:** ${audit.summary}`, "");
+  lines.push(`**Evidence mode:** ${audit.evidenceMode === "runtime_augmented" ? "runtime-augmented" : "heuristic-only"}`);
+  lines.push(`**Evidence summary:** ${audit.evidenceSummary}`, "");
   lines.push("| Signal | Count |", "| --- | ---: |");
   lines.push(`| Changed source files | ${audit.changedSourceFiles.length} |`);
   lines.push(`| Changed test files | ${audit.changedTestFiles.length} |`);
@@ -588,7 +590,7 @@ function appendTestAudit(lines: string[], audit: TestProofAudit): void {
   lines.push(`| Weak-test findings | ${audit.weakTestFindings.length} |`, "");
 
   if (audit.missingTestFindings.length === 0 && audit.weakTestFindings.length === 0) {
-    lines.push("No missing-test or weak-test findings were detected by deterministic rules.", "");
+    lines.push("No missing-test or weak-test findings were detected by deterministic rules or runtime coverage inputs.", "");
   }
 
   for (const finding of [...audit.missingTestFindings, ...audit.weakTestFindings].slice(0, 10)) {

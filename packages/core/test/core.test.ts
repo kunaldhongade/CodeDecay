@@ -104,6 +104,8 @@ describe("createAnalysisReport", () => {
     expect(report.summary.mergeRiskScore).toBeGreaterThan(0);
     expect(report.summary.decayScore).toBeGreaterThan(0);
     expect(report.summary.findingCounts.high).toBe(1);
+    expect(report.summary.mergeRiskBreakdown?.contributors.length).toBeGreaterThan(0);
+    expect(report.summary.decayBreakdown?.contributors.length).toBeGreaterThan(0);
     expect(report.impactedRoutes).toEqual([
       {
         framework: "express",
@@ -156,7 +158,7 @@ describe("createAnalysisReport", () => {
 
   it("caps merge risk at low when all merge-risk findings are low severity", () => {
     const changedFiles = createSyntheticChanges(16);
-    const findings = createSyntheticFindings(16, "low");
+    const findings = createSyntheticFindings(16, "low", "risky-auth-change");
 
     const report = createAnalysisReport({
       changedFiles,
@@ -175,7 +177,7 @@ describe("createAnalysisReport", () => {
 
   it("caps merge risk at medium when all merge-risk findings are medium severity", () => {
     const changedFiles = createSyntheticChanges(8);
-    const findings = createSyntheticFindings(8, "medium");
+    const findings = createSyntheticFindings(8, "medium", "risky-auth-change");
 
     const report = createAnalysisReport({
       changedFiles,
@@ -195,7 +197,7 @@ describe("createAnalysisReport", () => {
 
   it("allows high merge risk when high-severity findings are present", () => {
     const changedFiles = createSyntheticChanges(3);
-    const findings = createSyntheticFindings(3, "high");
+    const findings = createSyntheticFindings(3, "high", "risky-auth-change");
 
     const report = createAnalysisReport({
       changedFiles,
@@ -211,6 +213,27 @@ describe("createAnalysisReport", () => {
     expect(report.summary.riskLevel).toBe("high");
     expect(shouldFailForRisk(report.summary.riskLevel, "high")).toBe(true);
   });
+
+  it("caps heuristic-only merge risk below high even with severe findings", () => {
+    const changedFiles = createSyntheticChanges(6);
+    const findings = createSyntheticFindings(4, "high", "snapshot-only-test", "coverage");
+
+    const report = createAnalysisReport({
+      changedFiles,
+      analyzerResult: {
+        impactedAreas: [],
+        findings,
+        recommendedTests: []
+      },
+      generatedAt: "2026-06-22T00:00:00.000Z"
+    });
+
+    expect(report.summary.mergeRiskScore).toBeLessThanOrEqual(54);
+    expect(report.summary.mergeRiskBreakdown?.heuristicOnly).toBe(true);
+    expect(report.summary.mergeRiskBreakdown?.dampeners).toEqual(
+      expect.arrayContaining([expect.objectContaining({ id: "heuristic-only-dampener" })])
+    );
+  });
 });
 
 function createSyntheticChanges(count: number): FileChange[] {
@@ -223,13 +246,18 @@ function createSyntheticChanges(count: number): FileChange[] {
   }));
 }
 
-function createSyntheticFindings(count: number, severity: Finding["severity"]): Finding[] {
+function createSyntheticFindings(
+  count: number,
+  severity: Finding["severity"],
+  ruleId: string = `synthetic-${severity}`,
+  category: Finding["category"] = "regression"
+): Finding[] {
   return Array.from({ length: count }, (_, index) => ({
-    ruleId: `synthetic-${severity}-${index}`,
+    ruleId: `${ruleId}-${index}`,
     title: "Synthetic finding",
     description: "Synthetic scoring fixture.",
     severity,
-    category: "regression",
+    category,
     file: `src/file-${index}.ts`,
     line: 1
   }));

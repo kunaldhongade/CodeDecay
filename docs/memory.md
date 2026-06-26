@@ -18,6 +18,31 @@ npx codedecay memory --cwd ../my-repo --format json
 `codedecay analyze` automatically applies memory when `.codedecay/memory.json`
 exists in the analyzed repository.
 
+## Import Structured Learnings
+
+Use `codedecay memory-import` when you want to turn structured learnings into a
+reviewable local memory file instead of hand-editing everything.
+
+```bash
+npx codedecay memory-import --input incidents.json
+npx codedecay memory-import --input incidents.json --apply --format json
+```
+
+Current import shapes include:
+
+- direct CodeDecay memory sections such as `flows`, `commands`, `invariants`,
+  `architecture`, and `regressions`
+- `ciFailures`
+- `incidents`
+- `pullRequests`
+
+The command previews the merged result by default. Use `--apply` to write the
+normalized output to `.codedecay/memory.json`.
+
+Imported learnings remain local-first and reviewable in git. After import, the
+next `codedecay analyze`, `redteam`, or `agent` run will use the merged memory
+to produce deterministic findings and recommended checks.
+
 ## File Format
 
 ```json

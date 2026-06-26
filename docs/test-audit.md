@@ -1,25 +1,39 @@
-# Test Proof Audit
+# Test Evidence Audit
 
-CodeDecay summarizes deterministic test signals into a test proof audit.
+CodeDecay summarizes deterministic and runtime-backed test signals into a test
+evidence audit.
 
 The audit asks:
 
 ```text
-Are the changed tests actually proving the changed behavior will not break?
+Are the changed tests producing meaningful evidence that the changed behavior is safe?
 ```
 
-The first implementation is deterministic and uses existing analyzer findings.
-It does not run mutation testing, execute commands, call models, or use cloud
-services.
+The first implementation starts with deterministic analyzer findings and can
+augment them with runtime coverage artifacts when they are present. It does not
+run mutation testing, execute commands, call models, or use cloud services.
+
+## Evidence Modes
+
+- `heuristic_only`: no runtime coverage artifact was found, so the audit uses
+  deterministic signals only.
+- `runtime_augmented`: CodeDecay found runtime coverage artifacts and mapped
+  changed files or lines to measured execution.
+
+Current coverage sources:
+
+- Istanbul `coverage-final.json`
+- LCOV `lcov.info`
+- V8 JSON coverage
 
 ## Statuses
 
-- `missing`: changed source behavior does not have nearby changed test proof.
-- `weak`: changed tests exist, but deterministic rules found weak proof
+- `missing`: changed source behavior does not have nearby changed test evidence.
+- `weak`: changed tests exist, but CodeDecay found weak evidence
   signals.
-- `present`: changed tests are present and no deterministic weak-test signals
-  were found.
-- `not_applicable`: no changed source or test files require a test proof audit.
+- `present`: changed tests are present and no weak evidence signals were found.
+- `not_applicable`: no changed source or test files require a test evidence
+  audit.
 
 ## Current Signals
 

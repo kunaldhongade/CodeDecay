@@ -6,7 +6,7 @@ developer or their own coding agent can use before merge.
 It asks:
 
 ```text
-What could this PR break, and are the tests actually proving it will not?
+What could this PR break, and what evidence says it is safe?
 ```
 
 The command is report-only in the current MVP. It does not run configured
@@ -38,8 +38,9 @@ Exit codes:
 - concrete route/API impacts when CodeDecay can detect them, such as Next.js
   API routes, Next.js UI routes, Express handlers, or Fastify handlers
 - merge-risk and decay-risk scores
-- test proof audit status: `missing`, `weak`, `present`, or `not_applicable`
-- weak-test and missing-test findings from deterministic test-audit rules
+- test evidence audit status: `missing`, `weak`, `present`, or `not_applicable`
+- weak-test and missing-test findings from deterministic rules and runtime
+  coverage gaps when present
 - deterministic missing edge-case checklist
 - local memory summary from `.codedecay/memory.json`
 - repo-local agent skill summaries from `.agents/skills/*/SKILL.md`

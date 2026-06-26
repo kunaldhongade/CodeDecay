@@ -58,6 +58,61 @@ export interface AnalyzerResult {
   impactedAreas: ImpactedArea[];
   impactedRoutes?: ImpactedRoute[] | undefined;
   recommendedTests: string[];
+  testEvidence?: TestEvidenceSummary | undefined;
+}
+
+export type ScoreEvidenceKind = "direct" | "heuristic" | "structural";
+
+export interface ScoreContributor {
+  id: string;
+  label: string;
+  points: number;
+  evidence: ScoreEvidenceKind;
+  reason: string;
+  category?: FindingCategory | undefined;
+  severity?: RiskLevel | undefined;
+  ruleId?: string | undefined;
+  file?: string | undefined;
+  line?: number | undefined;
+}
+
+export interface ScoreBreakdown {
+  score: number;
+  rawScore: number;
+  adjustedScore: number;
+  highestSeverity?: RiskLevel | undefined;
+  heuristicOnly: boolean;
+  contributors: ScoreContributor[];
+  dampeners: ScoreContributor[];
+  notes: string[];
+}
+
+export type RuntimeCoverageSourceKind = "istanbul" | "lcov" | "v8";
+
+export interface TestEvidenceSource {
+  kind: RuntimeCoverageSourceKind;
+  path: string;
+}
+
+export type ChangedSourceCoverageStatus = "covered" | "partial" | "not_covered" | "not_measured";
+
+export interface ChangedSourceCoverage {
+  path: string;
+  status: ChangedSourceCoverageStatus;
+  measuredLines: number[];
+  coveredLines: number[];
+  uncoveredLines: number[];
+  sourceKinds: RuntimeCoverageSourceKind[];
+  sourcePaths: string[];
+}
+
+export type TestEvidenceMode = "heuristic_only" | "runtime_augmented";
+
+export interface TestEvidenceSummary {
+  mode: TestEvidenceMode;
+  sources: TestEvidenceSource[];
+  changedSources: ChangedSourceCoverage[];
+  notes: string[];
 }
 
 export interface ReportSummary {
@@ -65,6 +120,8 @@ export interface ReportSummary {
   decayScore: number;
   riskLevel: RiskLevel;
   findingCounts: Record<RiskLevel, number>;
+  mergeRiskBreakdown?: ScoreBreakdown | undefined;
+  decayBreakdown?: ScoreBreakdown | undefined;
 }
 
 export interface CodeDecayReport {
@@ -79,6 +136,7 @@ export interface CodeDecayReport {
   impactedRoutes?: ImpactedRoute[] | undefined;
   findings: Finding[];
   recommendedTests: string[];
+  testEvidence?: TestEvidenceSummary | undefined;
 }
 
 const RISK_ORDER: Record<RiskLevel, number> = {
@@ -87,10 +145,16 @@ const RISK_ORDER: Record<RiskLevel, number> = {
   high: 2
 };
 
-const FINDING_WEIGHTS: Record<RiskLevel, number> = {
+const DIRECT_FINDING_WEIGHTS: Record<RiskLevel, number> = {
   low: 6,
   medium: 16,
   high: 30
+};
+
+const HEURISTIC_FINDING_WEIGHTS: Record<RiskLevel, number> = {
+  low: 4,
+  medium: 10,
+  high: 18
 };
 
 const DECAY_CATEGORIES = new Set<FindingCategory>(["decay", "scope"]);
@@ -98,6 +162,25 @@ const MERGE_RISK_CATEGORIES = new Set<FindingCategory>([
   "regression",
   "coverage",
   "configuration"
+]);
+
+const DIRECT_FINDING_RULE_IDS = new Set([
+  "risky-auth-change",
+  "risky-database-change",
+  "risky-api-change",
+  "risky-config-change",
+  "memory-invariant-impacted",
+  "memory-past-regression-area",
+  "runtime-coverage-miss",
+  "runtime-coverage-partial"
+]);
+
+const HEURISTIC_REGRESSION_RULE_IDS = new Set([
+  "risky-ui-change",
+  "risky-test-change",
+  "risky-source-change",
+  "risky-docs-change",
+  "memory-architecture-note"
 ]);
 
 export function riskLevelFromScore(score: number): RiskLevel {
@@ -153,8 +236,10 @@ export function createAnalysisReport(input: {
   generatedAt?: string | undefined;
 }): CodeDecayReport {
   const findings = sortFindings(input.analyzerResult.findings);
-  const mergeRiskScore = calculateScore(findings, MERGE_RISK_CATEGORIES, input.changedFiles);
-  const decayScore = calculateScore(findings, DECAY_CATEGORIES, input.changedFiles);
+  const mergeRiskBreakdown = calculateScoreBreakdown(findings, MERGE_RISK_CATEGORIES, input.changedFiles, "merge");
+  const decayBreakdown = calculateScoreBreakdown(findings, DECAY_CATEGORIES, input.changedFiles, "decay");
+  const mergeRiskScore = mergeRiskBreakdown.score;
+  const decayScore = decayBreakdown.score;
   const riskLevel = riskLevelFromScore(Math.max(mergeRiskScore, decayScore));
   const impactedRoutes = mergeImpactedRoutes(input.analyzerResult.impactedRoutes ?? []);
   const routeRecommendedTests = impactedRoutes.flatMap((route) => route.recommendedTests);
@@ -167,7 +252,9 @@ export function createAnalysisReport(input: {
       mergeRiskScore,
       decayScore,
       riskLevel,
-      findingCounts: findingCounts(findings)
+      findingCounts: findingCounts(findings),
+      mergeRiskBreakdown,
+      decayBreakdown
     },
     changedFiles: input.changedFiles,
     impactedAreas: mergeImpactedAreas(input.analyzerResult.impactedAreas),
@@ -185,6 +272,10 @@ export function createAnalysisReport(input: {
 
   if (input.head) {
     report.head = input.head;
+  }
+
+  if (input.analyzerResult.testEvidence) {
+    report.testEvidence = input.analyzerResult.testEvidence;
   }
 
   return report;
@@ -227,25 +318,126 @@ function mergeImpactedRoutes(routes: ImpactedRoute[]): ImpactedRoute[] {
   });
 }
 
-function calculateScore(
+function calculateScoreBreakdown(
   findings: Finding[],
   includedCategories: Set<FindingCategory>,
-  changedFiles: FileChange[]
-): number {
+  changedFiles: FileChange[],
+  scoreKind: "merge" | "decay"
+): ScoreBreakdown {
   const relevantFindings = findings.filter((finding) => includedCategories.has(finding.category));
-  const findingScore = relevantFindings.reduce(
-    (score, finding) => score + FINDING_WEIGHTS[finding.severity],
-    0
+  const contributors = relevantFindings.map((finding) => createFindingContributor(finding));
+  const directContributors = contributors.filter((contributor) => contributor.evidence === "direct");
+  const heuristicOnly = relevantFindings.length > 0 && directContributors.length === 0;
+  const structuralMultiplier = directContributors.length > 0 ? 1 : relevantFindings.length > 0 ? 0.5 : 0;
+  const changeSizeScore = Math.round(
+    Math.min(
+      18,
+      Math.floor(changedFiles.reduce((sum, file) => sum + file.additions + file.deletions, 0) / 120) * 3
+    ) * structuralMultiplier
   );
+  const fileSpreadScore = Math.round(Math.min(12, Math.max(0, changedFiles.length - 5) * 2) * structuralMultiplier);
 
-  const changeSizeScore = Math.min(
-    18,
-    Math.floor(changedFiles.reduce((sum, file) => sum + file.additions + file.deletions, 0) / 120) * 3
-  );
+  if (changeSizeScore > 0) {
+    contributors.push({
+      id: "change-size",
+      label: "Change size",
+      points: changeSizeScore,
+      evidence: "structural",
+      reason: `Changed lines amplify review cost across ${changedFiles.length} file(s).`
+    });
+  }
 
-  const fileSpreadScore = Math.min(12, Math.max(0, changedFiles.length - 5) * 2);
+  if (fileSpreadScore > 0) {
+    contributors.push({
+      id: "file-spread",
+      label: "File spread",
+      points: fileSpreadScore,
+      evidence: "structural",
+      reason: `Change breadth spans ${changedFiles.length} file(s).`
+    });
+  }
 
-  return capScoreByHighestSeverity(clampScore(findingScore + changeSizeScore + fileSpreadScore), relevantFindings);
+  const rawScore = clampScore(contributors.reduce((score, contributor) => score + contributor.points, 0));
+  const dampeners: ScoreContributor[] = [];
+  let adjustedScore = rawScore;
+
+  if (scoreKind === "merge" && heuristicOnly) {
+    const dampenerPoints = Math.min(16, Math.max(4, Math.round(rawScore * 0.25)));
+    dampeners.push({
+      id: "heuristic-only-dampener",
+      label: "Heuristic-only dampener",
+      points: -dampenerPoints,
+      evidence: "heuristic",
+      reason: "Merge risk stays conservative until direct regression, configuration, or runtime coverage evidence exists."
+    });
+    adjustedScore = clampScore(adjustedScore - dampenerPoints);
+  }
+
+  let score = capScoreByHighestSeverity(adjustedScore, relevantFindings);
+  const notes: string[] = [];
+  if (scoreKind === "merge" && heuristicOnly) {
+    score = Math.min(score, 54);
+    notes.push("Heuristic-only merge risk is capped at 54/100 until direct regression, configuration, or runtime coverage evidence exists.");
+  }
+
+  if (changeSizeScore === 0 && fileSpreadScore === 0 && relevantFindings.length > 0) {
+    notes.push("Blast-radius multipliers were suppressed because the current finding set is narrow or low-signal.");
+  }
+
+  return {
+    score,
+    rawScore,
+    adjustedScore,
+    highestSeverity: highestFindingSeverity(relevantFindings),
+    heuristicOnly,
+    contributors: sortScoreContributors(contributors),
+    dampeners: sortScoreContributors(dampeners),
+    notes
+  };
+}
+
+function createFindingContributor(finding: Finding): ScoreContributor {
+  const evidence = scoreEvidenceForFinding(finding);
+  const points = (evidence === "direct" ? DIRECT_FINDING_WEIGHTS : HEURISTIC_FINDING_WEIGHTS)[finding.severity];
+  return {
+    id: `${finding.ruleId}:${finding.file ?? ""}:${finding.line ?? ""}`,
+    label: finding.title,
+    points,
+    evidence,
+    reason: finding.description,
+    category: finding.category,
+    severity: finding.severity,
+    ruleId: finding.ruleId,
+    file: finding.file,
+    line: finding.line
+  };
+}
+
+function scoreEvidenceForFinding(finding: Finding): ScoreEvidenceKind {
+  if ([...DIRECT_FINDING_RULE_IDS].some((ruleId) => finding.ruleId === ruleId || finding.ruleId.startsWith(`${ruleId}-`))) {
+    return "direct";
+  }
+
+  if (finding.category === "configuration") {
+    return "direct";
+  }
+
+  if (finding.category === "regression" && !HEURISTIC_REGRESSION_RULE_IDS.has(finding.ruleId)) {
+    return "direct";
+  }
+
+  return "heuristic";
+}
+
+function sortScoreContributors(contributors: ScoreContributor[]): ScoreContributor[] {
+  return [...contributors].sort((left, right) => {
+    const points = Math.abs(right.points) - Math.abs(left.points);
+    if (points !== 0) {
+      return points;
+    }
+
+    return left.label.localeCompare(right.label);
+  });
 }
 
 function clampScore(score: number): number {

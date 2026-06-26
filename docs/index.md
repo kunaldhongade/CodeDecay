@@ -4,7 +4,7 @@ layout: home
 hero:
   name: CodeDecay Docs
   text: PR safety docs for humans and AI agents
-  tagline: Static, searchable documentation with deploy-ready llms.txt, llms-full.txt, and raw Markdown endpoints for agent tooling.
+  tagline: Deterministic, local-first docs with deploy-ready llms.txt, llms-full.txt, and raw Markdown endpoints for agent tooling.
   actions:
     - theme: brand
       text: Start with the CLI
@@ -24,6 +24,8 @@ features:
     details: Fast static pages, local search, edit links, last-updated metadata, and sample outputs for review and adoption.
   - title: Agent-ready by default
     details: Each deploy includes llms.txt, llms-full.txt, and stable raw Markdown copies under /markdown for tools and MCP clients.
+  - title: Deterministic first
+    details: The default CLI and GitHub Action workflow is local, deterministic, and free of hidden model calls. Optional assisted workflows are documented separately.
   - title: Repo-native
     details: The site reads the existing Markdown in this repository and builds with one command. No separate CMS, dashboard, or hosted docs lock-in.
   - title: Safe to host anywhere
@@ -35,8 +37,11 @@ features:
 - [Getting Started](/getting-started): install the CLI and run your first PR analysis
 - [GitHub Action](/github-action): add CodeDecay to pull request workflows
 - [Redteam Reports](/redteam): generate merge-safety reports for yourself or your coding agent
+- [Editor Workflows](/editor-workflows): surface JSON and SARIF findings in VS Code or other local tools before opening a PR
+- [Trend Snapshots](/trend-snapshots): persist repository health snapshots and compare them over time without a hosted dashboard
 - [Agent Task Bundles](/agent): hand deterministic evidence to Codex, Claude Code, Cursor, Pi, OpenCode, or desktop agents
 - [MCP Server](/mcp): expose CodeDecay as a local MCP tool for agent clients
+- [Release Policy](/release-policy): understand the current compatibility contract before wiring CodeDecay into CI
 
 ## For Humans
 

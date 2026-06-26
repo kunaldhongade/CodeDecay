@@ -1,14 +1,18 @@
-import { readdirSync, readFileSync, statSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { basename, dirname, extname, join, relative } from "node:path";
 import { parse } from "@babel/parser";
 import type {
   AnalyzerResult,
+  ChangedSourceCoverage,
   ChangedLine,
   FileChange,
   Finding,
   ImpactedRoute,
   ImpactedArea,
-  RiskLevel
+  RiskLevel,
+  RuntimeCoverageSourceKind,
+  TestEvidenceSource,
+  TestEvidenceSummary
 } from "@submuxhq/codedecay-core";
 import { dedupeStrings } from "@submuxhq/codedecay-core";
 
@@ -38,9 +42,34 @@ interface TestAuditResult {
   recommendedTests: string[];
 }
 
+interface RuntimeCoverageLineMapEntry {
+  measured: Set<number>;
+  covered: Set<number>;
+  sourceKinds: Set<RuntimeCoverageSourceKind>;
+  sourcePaths: Set<string>;
+}
+
+interface RuntimeCoverageData {
+  sources: TestEvidenceSource[];
+  linesByFile: Map<string, RuntimeCoverageLineMapEntry>;
+}
+
+interface RuntimeCoverageAnalysis {
+  findings: Finding[];
+  recommendedTests: string[];
+  testEvidence: TestEvidenceSummary;
+}
+
+interface PropagatedRouteImpactAnalysis {
+  impactedRoutes: ImpactedRoute[];
+  findings: Finding[];
+  recommendedTests: string[];
+}
+
 type HttpMethod = "GET" | "POST" | "PUT" | "PATCH" | "DELETE" | "HEAD" | "OPTIONS";
 
 const SOURCE_EXTENSIONS = new Set([".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx"]);
+const SOURCE_EXTENSION_CANDIDATES = [".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx"];
 const TEST_DIR_NAMES = new Set(["test", "tests", "spec", "specs", "e2e", "integration", "__tests__", "__specs__"]);
 const TEST_FILE_STEM_PATTERN = /(^|[._-])(test|spec|e2e|integration)([._-]|$)/i;
 const IGNORED_DIRS = new Set([".git", "node_modules", "dist", "coverage", ".next", "build"]);
@@ -62,6 +91,11 @@ export function analyzeJsProject(options: AnalyzeJsOptions): AnalyzerResult {
     (change) => isSourcePath(change.path) && change.status !== "deleted" && !isTestPath(change.path)
   );
   const changedTestFiles = options.changedFiles.filter((change) => isTestPath(change.path));
+  const runtimeCoverage = analyzeRuntimeCoverage(options.rootDir, changedSourceFiles);
+  const reverseImportGraph = buildReverseImportGraph(options.rootDir);
+  const fullyCoveredSourcePaths = new Set(
+    runtimeCoverage.testEvidence.changedSources.filter((entry) => entry.status === "covered").map((entry) => entry.path)
+  );
 
   for (const change of options.changedFiles) {
     const classification = classifyPath(change.path);
@@ -86,9 +120,15 @@ export function analyzeJsProject(options: AnalyzeJsOptions): AnalyzerResult {
   }
 
   impactedRoutes.push(...detectImpactedRoutes(options.rootDir, changedSourceFiles));
+  const propagatedRouteImpacts = detectPropagatedRouteImpacts(options.rootDir, changedSourceFiles, reverseImportGraph);
+  impactedRoutes.push(...propagatedRouteImpacts.impactedRoutes);
+  findings.push(...propagatedRouteImpacts.findings);
+  recommendedTests.push(...propagatedRouteImpacts.recommendedTests);
 
   if (changedSourceFiles.length > 0 && changedTestFiles.length === 0) {
-    const riskySourceFiles = changedSourceFiles.filter((change) => classifyPath(change.path)?.risk !== "low");
+    const riskySourceFiles = changedSourceFiles
+      .filter((change) => classifyPath(change.path)?.risk !== "low")
+      .filter((change) => !fullyCoveredSourcePaths.has(change.path));
     if (riskySourceFiles.length > 0) {
       findings.push({
         ruleId: "missing-nearby-tests",
@@ -112,6 +152,8 @@ export function analyzeJsProject(options: AnalyzeJsOptions): AnalyzerResult {
   findings.push(...detectFragilePatterns(options.changedFiles));
   findings.push(...detectTestBloat(options.changedFiles, changedSourceFiles));
   findings.push(...detectDuplicateAddedLogic(options.changedFiles));
+  findings.push(...runtimeCoverage.findings);
+  recommendedTests.push(...runtimeCoverage.recommendedTests);
 
   const testAudit = detectWeakTests(options.rootDir, changedTestFiles, changedSourceFiles);
   findings.push(...testAudit.findings);
@@ -154,8 +196,9 @@ export function analyzeJsProject(options: AnalyzeJsOptions): AnalyzerResult {
   return {
     findings: dedupeFindings(findings),
     impactedAreas,
-    impactedRoutes,
-    recommendedTests: recommendedTests.length > 0 ? dedupeStrings(recommendedTests) : ["Run the test suite for changed packages or apps."]
+    impactedRoutes: mergeImpactedRoutes(impactedRoutes),
+    recommendedTests: recommendedTests.length > 0 ? dedupeStrings(recommendedTests) : ["Run the test suite for changed packages or apps."],
+    testEvidence: runtimeCoverage.testEvidence
   };
 }
 
@@ -204,14 +247,78 @@ function classifyPath(path: string): PathClassification | undefined {
 }
 
 function detectImpactedRoutes(rootDir: string, changedSourceFiles: FileChange[]): ImpactedRoute[] {
-  return changedSourceFiles.flatMap((change) => {
-    const content = readChangedFile(rootDir, change.path) ?? change.addedLines.map((line) => line.content).join("\n");
+  return mergeImpactedRoutes(
+    changedSourceFiles.flatMap((change) => {
+      const content = readChangedFile(rootDir, change.path) ?? change.addedLines.map((line) => line.content).join("\n");
 
-    return [...detectNextjsRoute(change, content), ...detectNodeRoutes(change, content)];
-  });
+      return detectRoutesForFile(change.path, content);
+    })
+  );
 }
 
-function detectNextjsRoute(change: FileChange, content: string): ImpactedRoute[] {
+function detectPropagatedRouteImpacts(
+  rootDir: string,
+  changedSourceFiles: FileChange[],
+  reverseImportGraph: Map<string, string[]>
+): PropagatedRouteImpactAnalysis {
+  const impactedRoutes: ImpactedRoute[] = [];
+  const findings: Finding[] = [];
+  const recommendedTests: string[] = [];
+
+  for (const change of changedSourceFiles) {
+    const chains = findReverseImportChains(normalizePath(change.path), reverseImportGraph);
+
+    for (const chain of chains) {
+      const importerPath = chain.at(-1);
+      if (!importerPath) {
+        continue;
+      }
+
+      const content = readChangedFile(rootDir, importerPath);
+      if (!content) {
+        continue;
+      }
+
+      const routes = detectRoutesForFile(importerPath, content);
+      if (routes.length === 0) {
+        continue;
+      }
+
+      const chainLabel = chain.join(" -> ");
+      for (const route of routes) {
+        impactedRoutes.push({
+          ...route,
+          files: dedupeStrings([...route.files, change.path]),
+          reasons: dedupeStrings([...route.reasons, `Propagated through local imports: ${chainLabel}`])
+        });
+
+        findings.push({
+          ruleId: "propagated-route-impact",
+          title: "Changed module flows into a route or API boundary",
+          description: `${change.path} reaches ${route.route} through local import chain ${chainLabel}. Review the full user-facing or API boundary, not only the changed helper.`,
+          severity: route.risk,
+          category: "regression",
+          file: change.path,
+          line: firstLine(change)
+        });
+
+        recommendedTests.push(`Add or run tests covering ${importerPath} because it depends on ${change.path}`);
+      }
+    }
+  }
+
+  return {
+    impactedRoutes: mergeImpactedRoutes(impactedRoutes),
+    findings: dedupeFindings(findings),
+    recommendedTests: dedupeStrings(recommendedTests)
+  };
+}
+
+function detectRoutesForFile(path: string, content: string): ImpactedRoute[] {
+  return [...detectNextjsRoute({ path }, content), ...detectNodeRoutes({ path }, content)];
+}
+
+function detectNextjsRoute(change: { path: string }, content: string): ImpactedRoute[] {
   const normalized = normalizePath(change.path);
   const withoutSrc = normalized.replace(/^src\//, "");
 
@@ -277,7 +384,7 @@ function detectNextjsRoute(change: FileChange, content: string): ImpactedRoute[]
   return [];
 }
 
-function detectNodeRoutes(change: FileChange, content: string): ImpactedRoute[] {
+function detectNodeRoutes(change: { path: string }, content: string): ImpactedRoute[] {
   if (!isNodeRouteCandidate(change.path)) {
     return [];
   }
@@ -315,7 +422,7 @@ function detectNodeRoutes(change: FileChange, content: string): ImpactedRoute[] 
   return routes;
 }
 
-function detectFastifyRouteObjects(change: FileChange, content: string): ImpactedRoute[] {
+function detectFastifyRouteObjects(change: { path: string }, content: string): ImpactedRoute[] {
   const routes: ImpactedRoute[] = [];
   const routeObjectPattern = /\b(?:server|fastify)\.route\s*\(\s*\{([\s\S]*?)\}\s*\)/gi;
   let match: RegExpExecArray | null;
@@ -363,6 +470,37 @@ function routeImpact(input: {
     reasons: input.reasons,
     recommendedTests: [`Add or run tests covering ${input.file}`]
   };
+}
+
+function mergeImpactedRoutes(routes: ImpactedRoute[]): ImpactedRoute[] {
+  const byKey = new Map<string, ImpactedRoute>();
+
+  for (const route of routes) {
+    const key = `${route.framework}:${route.kind}:${route.route}:${route.methods.join(",")}`;
+    const existing = byKey.get(key);
+
+    if (!existing) {
+      byKey.set(key, {
+        ...route,
+        files: [...route.files],
+        reasons: [...route.reasons],
+        recommendedTests: [...route.recommendedTests]
+      });
+      continue;
+    }
+
+    existing.files = dedupeStrings([...existing.files, ...route.files]);
+    existing.reasons = dedupeStrings([...existing.reasons, ...route.reasons]);
+    existing.risk = higherRisk(existing.risk, route.risk);
+    existing.recommendedTests = dedupeStrings([...existing.recommendedTests, ...route.recommendedTests]);
+  }
+
+  return [...byKey.values()];
+}
+
+function higherRisk(left: RiskLevel, right: RiskLevel): RiskLevel {
+  const score = (value: RiskLevel): number => (value === "high" ? 3 : value === "medium" ? 2 : 1);
+  return score(left) >= score(right) ? left : right;
 }
 
 function findExportedHttpMethods(content: string): string[] {
@@ -449,6 +587,558 @@ function recommendTests(rootDir: string, sourceChanges: FileChange[]): string[] 
   }
 
   return recommendations;
+}
+
+function analyzeRuntimeCoverage(rootDir: string, changedSourceFiles: FileChange[]): RuntimeCoverageAnalysis {
+  const coverageData = loadRuntimeCoverageData(rootDir);
+  const changedSources = changedSourceFiles.map((change) => classifyChangedSourceCoverage(change, coverageData.linesByFile.get(change.path)));
+  const findings: Finding[] = [];
+  const recommendedTests: string[] = [];
+
+  for (const entry of changedSources) {
+    const classification = classifyPath(entry.path);
+    const severity: RiskLevel = classification?.risk === "high" ? "high" : "medium";
+    const uncoveredLines = entry.uncoveredLines.join(", ");
+
+    if (entry.status === "not_covered") {
+      findings.push({
+        ruleId: "runtime-coverage-miss",
+        title: "Changed source not executed by runtime coverage",
+        description: `${entry.path} has measured changed lines with zero runtime execution in available coverage artifacts.`,
+        severity,
+        category: "coverage",
+        file: entry.path,
+        line: entry.measuredLines[0]
+      });
+      recommendedTests.push(`Run or add tests that execute the changed lines in ${entry.path}.`);
+    }
+
+    if (entry.status === "partial") {
+      findings.push({
+        ruleId: "runtime-coverage-partial",
+        title: "Changed source only partially executed by runtime coverage",
+        description: `${entry.path} has uncovered changed lines${uncoveredLines ? ` (${uncoveredLines})` : ""} in available coverage artifacts.`,
+        severity: classification?.risk === "high" ? "high" : "medium",
+        category: "coverage",
+        file: entry.path,
+        line: entry.uncoveredLines[0] ?? entry.measuredLines[0]
+      });
+      recommendedTests.push(`Add runtime coverage for uncovered changed lines in ${entry.path}.`);
+    }
+  }
+
+  return {
+    findings,
+    recommendedTests,
+    testEvidence: {
+      mode: coverageData.sources.length > 0 ? "runtime_augmented" : "heuristic_only",
+      sources: coverageData.sources,
+      changedSources,
+      notes: buildRuntimeCoverageNotes(coverageData.sources, changedSources)
+    }
+  };
+}
+
+function loadRuntimeCoverageData(rootDir: string): RuntimeCoverageData {
+  const sources: TestEvidenceSource[] = [];
+  const linesByFile = new Map<string, RuntimeCoverageLineMapEntry>();
+
+  for (const artifact of findCoverageArtifacts(rootDir)) {
+    const artifactLines =
+      artifact.kind === "istanbul"
+        ? readIstanbulCoverage(rootDir, artifact.absolutePath)
+        : artifact.kind === "lcov"
+          ? readLcovCoverage(rootDir, artifact.absolutePath)
+          : readV8Coverage(rootDir, artifact.absolutePath);
+
+    if (artifactLines.size === 0) {
+      continue;
+    }
+
+    sources.push({
+      kind: artifact.kind,
+      path: artifact.relativePath
+    });
+
+    for (const [path, lines] of artifactLines) {
+      mergeRuntimeCoverageEntry(linesByFile, path, lines);
+    }
+  }
+
+  return {
+    sources: dedupeCoverageSources(sources),
+    linesByFile
+  };
+}
+
+function classifyChangedSourceCoverage(
+  change: FileChange,
+  entry: RuntimeCoverageLineMapEntry | undefined
+): ChangedSourceCoverage {
+  const changedLines = dedupeNumbers(change.addedLines.map((line) => line.line));
+
+  if (!entry) {
+    return {
+      path: change.path,
+      status: "not_measured",
+      measuredLines: [],
+      coveredLines: [],
+      uncoveredLines: [],
+      sourceKinds: [],
+      sourcePaths: []
+    };
+  }
+
+  const measuredLines = changedLines.filter((line) => entry.measured.has(line));
+  const coveredLines = measuredLines.filter((line) => entry.covered.has(line));
+  const uncoveredLines = measuredLines.filter((line) => !entry.covered.has(line));
+  const status =
+    measuredLines.length === 0
+      ? "not_measured"
+      : coveredLines.length === 0
+        ? "not_covered"
+        : coveredLines.length < measuredLines.length
+          ? "partial"
+          : "covered";
+
+  return {
+    path: change.path,
+    status,
+    measuredLines,
+    coveredLines,
+    uncoveredLines,
+    sourceKinds: dedupeStrings([...entry.sourceKinds]) as RuntimeCoverageSourceKind[],
+    sourcePaths: dedupeStrings([...entry.sourcePaths])
+  };
+}
+
+function buildRuntimeCoverageNotes(
+  sources: TestEvidenceSource[],
+  changedSources: ChangedSourceCoverage[]
+): string[] {
+  if (sources.length === 0) {
+    return ["No runtime coverage artifact was found. Test audit remains heuristic-only."];
+  }
+
+  const notMeasured = changedSources.filter((entry) => entry.status === "not_measured").map((entry) => entry.path);
+  if (notMeasured.length === 0) {
+    return ["Runtime coverage artifacts were found for the changed source files."];
+  }
+
+  return [`Runtime coverage artifacts were found, but some changed paths were not measured: ${notMeasured.join(", ")}.`];
+}
+
+function mergeRuntimeCoverageEntry(
+  target: Map<string, RuntimeCoverageLineMapEntry>,
+  path: string,
+  entry: RuntimeCoverageLineMapEntry
+): void {
+  const existing =
+    target.get(path) ??
+    ({
+      measured: new Set<number>(),
+      covered: new Set<number>(),
+      sourceKinds: new Set<RuntimeCoverageSourceKind>(),
+      sourcePaths: new Set<string>()
+    } satisfies RuntimeCoverageLineMapEntry);
+
+  for (const line of entry.measured) {
+    existing.measured.add(line);
+  }
+
+  for (const line of entry.covered) {
+    existing.covered.add(line);
+  }
+
+  for (const kind of entry.sourceKinds) {
+    existing.sourceKinds.add(kind);
+  }
+
+  for (const sourcePath of entry.sourcePaths) {
+    existing.sourcePaths.add(sourcePath);
+  }
+
+  target.set(path, existing);
+}
+
+function dedupeCoverageSources(sources: TestEvidenceSource[]): TestEvidenceSource[] {
+  const seen = new Set<string>();
+  const deduped: TestEvidenceSource[] = [];
+
+  for (const source of sources) {
+    const key = `${source.kind}:${source.path}`;
+    if (seen.has(key)) {
+      continue;
+    }
+
+    seen.add(key);
+    deduped.push(source);
+  }
+
+  return deduped.sort((left, right) => `${left.kind}:${left.path}`.localeCompare(`${right.kind}:${right.path}`));
+}
+
+function findCoverageArtifacts(
+  rootDir: string
+): Array<{ kind: RuntimeCoverageSourceKind; absolutePath: string; relativePath: string }> {
+  const discovered = new Map<string, { kind: RuntimeCoverageSourceKind; absolutePath: string; relativePath: string }>();
+  const explicitCandidates: Array<{ kind: RuntimeCoverageSourceKind; absolutePath: string }> = [
+    { kind: "istanbul", absolutePath: join(rootDir, "coverage", "coverage-final.json") },
+    { kind: "istanbul", absolutePath: join(rootDir, "coverage-final.json") },
+    { kind: "lcov", absolutePath: join(rootDir, "coverage", "lcov.info") },
+    { kind: "lcov", absolutePath: join(rootDir, "lcov.info") }
+  ];
+
+  for (const candidate of explicitCandidates) {
+    if (existsSync(candidate.absolutePath)) {
+      discovered.set(candidate.absolutePath, {
+        ...candidate,
+        relativePath: relative(rootDir, candidate.absolutePath).replaceAll("\\", "/")
+      });
+    }
+  }
+
+  for (const directory of ["coverage", ".v8-coverage", ".nyc_output"]) {
+    const absoluteDir = join(rootDir, directory);
+    if (!existsSync(absoluteDir)) {
+      continue;
+    }
+
+    for (const file of listCoverageFiles(rootDir, absoluteDir)) {
+      const kind = detectCoverageArtifactKind(file);
+      if (!kind) {
+        continue;
+      }
+
+      discovered.set(file, {
+        kind,
+        absolutePath: file,
+        relativePath: relative(rootDir, file).replaceAll("\\", "/")
+      });
+    }
+  }
+
+  return [...discovered.values()].sort((left, right) => left.relativePath.localeCompare(right.relativePath));
+}
+
+function listCoverageFiles(rootDir: string, currentDir: string): string[] {
+  const files: string[] = [];
+  const relativeDir = relative(rootDir, currentDir).replaceAll("\\", "/");
+  if (relativeDir.startsWith("..")) {
+    return files;
+  }
+
+  let entries: string[] = [];
+  try {
+    entries = readdirSync(currentDir);
+  } catch {
+    return files;
+  }
+
+  for (const entry of entries) {
+    const absolutePath = join(currentDir, entry);
+    let stats;
+    try {
+      stats = statSync(absolutePath);
+    } catch {
+      continue;
+    }
+
+    if (stats.isDirectory()) {
+      files.push(...listCoverageFiles(rootDir, absolutePath));
+      continue;
+    }
+
+    files.push(absolutePath);
+  }
+
+  return files;
+}
+
+function detectCoverageArtifactKind(absolutePath: string): RuntimeCoverageSourceKind | undefined {
+  const normalized = normalizePath(absolutePath).toLowerCase();
+  if (normalized.endsWith("/coverage-final.json") || normalized.endsWith("coverage-final.json")) {
+    return "istanbul";
+  }
+
+  if (normalized.endsWith("/lcov.info") || normalized.endsWith("lcov.info")) {
+    return "lcov";
+  }
+
+  if (normalized.endsWith(".json")) {
+    return "v8";
+  }
+
+  return undefined;
+}
+
+function readIstanbulCoverage(rootDir: string, absolutePath: string): Map<string, RuntimeCoverageLineMapEntry> {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(readFileSync(absolutePath, "utf8"));
+  } catch {
+    return new Map();
+  }
+
+  if (!isPlainObject(parsed)) {
+    return new Map();
+  }
+
+  const linesByFile = new Map<string, RuntimeCoverageLineMapEntry>();
+  for (const [rawPath, value] of Object.entries(parsed)) {
+    if (!isPlainObject(value)) {
+      continue;
+    }
+
+    const normalizedPath = normalizeCoveragePath(rootDir, rawPath);
+    if (!normalizedPath) {
+      continue;
+    }
+
+    if (isPlainObject(value.l)) {
+      for (const [rawLine, rawCount] of Object.entries(value.l)) {
+        const line = Number(rawLine);
+        const count = Number(rawCount);
+        if (!Number.isInteger(line) || Number.isNaN(count)) {
+          continue;
+        }
+
+        addCoverageLine(linesByFile, normalizedPath, line, count > 0, "istanbul", absolutePath);
+      }
+      continue;
+    }
+
+    if (!isPlainObject(value.statementMap) || !isPlainObject(value.s)) {
+      continue;
+    }
+
+    for (const [statementId, statement] of Object.entries(value.statementMap)) {
+      if (!isPlainObject(statement) || !isPlainObject(statement.start) || !isPlainObject(statement.end)) {
+        continue;
+      }
+
+      const startLine = Number(statement.start.line);
+      const endLine = Number(statement.end.line);
+      const count = Number(value.s[statementId]);
+      if (!Number.isInteger(startLine) || !Number.isInteger(endLine) || Number.isNaN(count)) {
+        continue;
+      }
+
+      for (let line = startLine; line <= endLine; line += 1) {
+        addCoverageLine(linesByFile, normalizedPath, line, count > 0, "istanbul", absolutePath);
+      }
+    }
+  }
+
+  return linesByFile;
+}
+
+function readLcovCoverage(rootDir: string, absolutePath: string): Map<string, RuntimeCoverageLineMapEntry> {
+  let raw: string;
+  try {
+    raw = readFileSync(absolutePath, "utf8");
+  } catch {
+    return new Map();
+  }
+
+  const linesByFile = new Map<string, RuntimeCoverageLineMapEntry>();
+  let currentFile: string | undefined;
+
+  for (const line of raw.split(/\r?\n/)) {
+    if (line.startsWith("SF:")) {
+      currentFile = normalizeCoveragePath(rootDir, line.slice(3).trim());
+      continue;
+    }
+
+    if (line.startsWith("DA:") && currentFile) {
+      const [rawLine, rawCount] = line.slice(3).split(",");
+      const lineNumber = Number(rawLine);
+      const count = Number(rawCount);
+      if (!Number.isInteger(lineNumber) || Number.isNaN(count)) {
+        continue;
+      }
+
+      addCoverageLine(linesByFile, currentFile, lineNumber, count > 0, "lcov", absolutePath);
+      continue;
+    }
+
+    if (line === "end_of_record") {
+      currentFile = undefined;
+    }
+  }
+
+  return linesByFile;
+}
+
+function readV8Coverage(rootDir: string, absolutePath: string): Map<string, RuntimeCoverageLineMapEntry> {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(readFileSync(absolutePath, "utf8"));
+  } catch {
+    return new Map();
+  }
+
+  const scripts = extractV8Scripts(parsed);
+  if (scripts.length === 0) {
+    return new Map();
+  }
+
+  const linesByFile = new Map<string, RuntimeCoverageLineMapEntry>();
+  for (const script of scripts) {
+    const normalizedPath = normalizeCoveragePath(rootDir, script.url);
+    if (!normalizedPath) {
+      continue;
+    }
+
+    const content = readChangedFile(rootDir, normalizedPath);
+    if (!content) {
+      continue;
+    }
+
+    const lineOffsets = createLineOffsets(content);
+    for (const range of script.ranges) {
+      const startLine = lineNumberForOffset(lineOffsets, range.startOffset);
+      const endLine = lineNumberForOffset(lineOffsets, Math.max(range.startOffset, range.endOffset - 1));
+      for (let line = startLine; line <= endLine; line += 1) {
+        addCoverageLine(linesByFile, normalizedPath, line, range.count > 0, "v8", absolutePath);
+      }
+    }
+  }
+
+  return linesByFile;
+}
+
+function extractV8Scripts(value: unknown): Array<{ url: string; ranges: Array<{ startOffset: number; endOffset: number; count: number }> }> {
+  const results = Array.isArray(value)
+    ? value
+    : isPlainObject(value) && Array.isArray(value.result)
+      ? value.result
+      : [];
+  const scripts: Array<{ url: string; ranges: Array<{ startOffset: number; endOffset: number; count: number }> }> = [];
+
+  for (const script of results) {
+    if (!isPlainObject(script) || typeof script.url !== "string" || !Array.isArray(script.functions)) {
+      continue;
+    }
+
+    const ranges: Array<{ startOffset: number; endOffset: number; count: number }> = [];
+    for (const fn of script.functions) {
+      if (!isPlainObject(fn) || !Array.isArray(fn.ranges)) {
+        continue;
+      }
+
+      for (const range of fn.ranges) {
+        if (!isPlainObject(range)) {
+          continue;
+        }
+
+        const startOffset = Number(range.startOffset);
+        const endOffset = Number(range.endOffset);
+        const count = Number(range.count);
+        if (!Number.isInteger(startOffset) || !Number.isInteger(endOffset) || Number.isNaN(count)) {
+          continue;
+        }
+
+        ranges.push({ startOffset, endOffset, count });
+      }
+    }
+
+    if (ranges.length > 0) {
+      scripts.push({ url: script.url, ranges });
+    }
+  }
+
+  return scripts;
+}
+
+function addCoverageLine(
+  linesByFile: Map<string, RuntimeCoverageLineMapEntry>,
+  path: string,
+  line: number,
+  covered: boolean,
+  sourceKind: RuntimeCoverageSourceKind,
+  sourcePath: string
+): void {
+  if (!Number.isInteger(line) || line <= 0) {
+    return;
+  }
+
+  const entry =
+    linesByFile.get(path) ??
+    ({
+      measured: new Set<number>(),
+      covered: new Set<number>(),
+      sourceKinds: new Set<RuntimeCoverageSourceKind>(),
+      sourcePaths: new Set<string>()
+    } satisfies RuntimeCoverageLineMapEntry);
+
+  entry.measured.add(line);
+  if (covered) {
+    entry.covered.add(line);
+  }
+  entry.sourceKinds.add(sourceKind);
+  entry.sourcePaths.add(normalizePath(sourcePath));
+  linesByFile.set(path, entry);
+}
+
+function normalizeCoveragePath(rootDir: string, rawPath: string): string | undefined {
+  if (typeof rawPath !== "string" || rawPath.trim().length === 0) {
+    return undefined;
+  }
+
+  const normalizedInput = normalizePath(rawPath.trim().replace(/^file:\/\//, ""));
+  if (normalizedInput.includes("://")) {
+    return undefined;
+  }
+
+  if (normalizedInput.startsWith("/")) {
+    const relativePath = relative(rootDir, normalizedInput).replaceAll("\\", "/");
+    if (!relativePath.startsWith("../")) {
+      return relativePath;
+    }
+  }
+
+  return normalizedInput.replace(/^\.\//, "");
+}
+
+function createLineOffsets(content: string): number[] {
+  const offsets = [0];
+  for (let index = 0; index < content.length; index += 1) {
+    if (content[index] === "\n") {
+      offsets.push(index + 1);
+    }
+  }
+  return offsets;
+}
+
+function lineNumberForOffset(offsets: number[], offset: number): number {
+  let low = 0;
+  let high = offsets.length - 1;
+
+  while (low <= high) {
+    const mid = Math.floor((low + high) / 2);
+    const current = offsets[mid] ?? 0;
+    const next = offsets[mid + 1] ?? Number.MAX_SAFE_INTEGER;
+    if (offset >= current && offset < next) {
+      return mid + 1;
+    }
+
+    if (offset < current) {
+      high = mid - 1;
+    } else {
+      low = mid + 1;
+    }
+  }
+
+  return offsets.length;
+}
+
+function dedupeNumbers(values: number[]): number[] {
+  return [...new Set(values)].sort((left, right) => left - right);
+}
+
+function isPlainObject(value: unknown): value is Record<string, any> {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }
 
 function detectBroadUnrelatedChanges(changedFiles: FileChange[]): Finding | undefined {
@@ -985,6 +1675,134 @@ function readChangedFile(rootDir: string, path: string): string | undefined {
   } catch {
     return undefined;
   }
+}
+
+function buildReverseImportGraph(rootDir: string): Map<string, string[]> {
+  const repoSourceFiles = listRepoFiles(rootDir)
+    .map((file) => normalizePath(file))
+    .filter((file) => isSourcePath(file) && !isTestPath(file));
+  const repoSourceSet = new Set(repoSourceFiles);
+  const importersBySource = new Map<string, Set<string>>();
+
+  for (const file of repoSourceFiles) {
+    const content = readChangedFile(rootDir, file);
+    if (!content) {
+      continue;
+    }
+
+    for (const specifier of extractLocalImportSpecifiers(content)) {
+      const resolved = resolveLocalImportSpecifier(file, specifier, repoSourceSet);
+      if (!resolved) {
+        continue;
+      }
+
+      const importers = importersBySource.get(resolved) ?? new Set<string>();
+      importers.add(file);
+      importersBySource.set(resolved, importers);
+    }
+  }
+
+  return new Map(
+    [...importersBySource.entries()].map(([source, importers]) => [source, [...importers].sort((left, right) => left.localeCompare(right))])
+  );
+}
+
+function extractLocalImportSpecifiers(content: string): string[] {
+  try {
+    const ast = parse(content, {
+      sourceType: "unambiguous",
+      plugins: ["typescript", "jsx", "decorators-legacy"],
+      errorRecovery: true,
+      ranges: false,
+      tokens: false
+    });
+    const specifiers = new Set<string>();
+
+    walk(ast, (node) => {
+      const type = getNodeType(node);
+      if (
+        (type === "ImportDeclaration" || type === "ExportNamedDeclaration" || type === "ExportAllDeclaration") &&
+        typeof node.source?.value === "string" &&
+        node.source.value.startsWith(".")
+      ) {
+        specifiers.add(node.source.value);
+      }
+
+      if (
+        type === "CallExpression" &&
+        getNodeType(node.callee) === "Identifier" &&
+        node.callee.name === "require" &&
+        Array.isArray(node.arguments) &&
+        typeof node.arguments[0]?.value === "string" &&
+        node.arguments[0].value.startsWith(".")
+      ) {
+        specifiers.add(node.arguments[0].value);
+      }
+
+      if (type === "ImportExpression" && typeof node.source?.value === "string" && node.source.value.startsWith(".")) {
+        specifiers.add(node.source.value);
+      }
+    });
+
+    return [...specifiers];
+  } catch {
+    return [];
+  }
+}
+
+function resolveLocalImportSpecifier(importerPath: string, specifier: string, repoSourceSet: Set<string>): string | undefined {
+  const relativeTarget = normalizePath(join(dirname(importerPath), specifier));
+  const candidates = new Set<string>();
+  candidates.add(relativeTarget);
+
+  if (!extname(relativeTarget)) {
+    for (const extension of SOURCE_EXTENSION_CANDIDATES) {
+      candidates.add(`${relativeTarget}${extension}`);
+      candidates.add(`${relativeTarget}/index${extension}`);
+    }
+  }
+
+  for (const candidate of candidates) {
+    if (repoSourceSet.has(candidate)) {
+      return candidate;
+    }
+  }
+
+  return undefined;
+}
+
+function findReverseImportChains(sourcePath: string, reverseImportGraph: Map<string, string[]>): string[][] {
+  const queue: string[][] = [[sourcePath]];
+  const visited = new Set<string>([sourcePath]);
+  const chains: string[][] = [];
+
+  while (queue.length > 0 && chains.length < 24) {
+    const chain = queue.shift();
+    if (!chain) {
+      continue;
+    }
+
+    const current = chain.at(-1);
+    if (!current) {
+      continue;
+    }
+
+    for (const importer of reverseImportGraph.get(current) ?? []) {
+      if (chain.includes(importer) || chain.length >= 6) {
+        continue;
+      }
+
+      const nextChain = [...chain, importer];
+      chains.push(nextChain);
+
+      if (!visited.has(importer)) {
+        visited.add(importer);
+        queue.push(nextChain);
+      }
+    }
+  }
+
+  return chains;
 }
 
 function listRepoFiles(rootDir: string): string[] {

@@ -245,6 +245,8 @@ function createFixtureReport(): RedteamReport {
     testAudit: {
       status: "weak",
       summary: "Changed tests do not prove the real path.",
+      evidenceMode: "heuristic_only",
+      evidenceSummary: "No runtime coverage artifact was found. Test audit remains heuristic-only.",
       changedSourceFiles: ["src/api/imu.ts"],
       changedTestFiles: ["src/api/imu.test.ts"],
       missingTestFindings: [],
@@ -259,7 +261,8 @@ function createFixtureReport(): RedteamReport {
           line: 3
         }
       ],
-      recommendedChecks: ["Add API-level IMU regression test."]
+      recommendedChecks: ["Add API-level IMU regression test."],
+      runtimeCoverage: []
     },
     weakTestFindings: [
       {

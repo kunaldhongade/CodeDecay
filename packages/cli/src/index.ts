@@ -24,14 +24,24 @@ import {
   createAnalysisReport,
   riskLevelFromScore,
   shouldFailForRisk,
-  type RiskLevel
+  type CodeDecayReport,
+  type RiskLevel,
+  type TestEvidenceMode
 } from "@submuxhq/codedecay-core";
 import { createGitWorktree, getGitChangedFiles, getRepoRoot, removeGitWorktree } from "@submuxhq/codedecay-git";
 import type { Evidence, HarnessFailure } from "@submuxhq/codedecay-harness";
-import { applyMemoryContext, loadCodeDecayMemory, type LoadedCodeDecayMemory } from "@submuxhq/codedecay-memory";
+import { createLlmProvider, type LlmCompletion, type LlmSuggestion } from "@submuxhq/codedecay-llm";
+import {
+  applyMemoryContext,
+  importCodeDecayMemory,
+  loadCodeDecayMemory,
+  writeCodeDecayMemory,
+  type LoadedCodeDecayMemory
+} from "@submuxhq/codedecay-memory";
 import { createRedteamReport, renderRedteamReport, type RedteamFormat } from "@submuxhq/codedecay-redteam";
 import { renderReport, type ReportFormat } from "@submuxhq/codedecay-report";
 import { loadCodeDecaySkills } from "@submuxhq/codedecay-skills";
+import { createTestProofAudit } from "@submuxhq/codedecay-test-audit";
 import { createConfiguredToolHarnesses, type ConfiguredToolAdapterKind } from "@submuxhq/codedecay-tool-adapters";
 
 interface AnalyzeOptions {
@@ -64,6 +74,32 @@ interface McpOptions {
 interface MemoryOptions {
   cwd?: string | undefined;
   format: ConfigFormat;
+}
+
+interface MemoryImportOptions {
+  cwd?: string | undefined;
+  input: string;
+  format: ConfigFormat;
+  apply: boolean;
+}
+
+interface SnapshotOptions {
+  base?: string | undefined;
+  head?: string | undefined;
+  cwd?: string | undefined;
+  compare?: string | undefined;
+  format: ConfigFormat;
+  output?: string | undefined;
+}
+
+interface LlmReviewOptions {
+  base?: string | undefined;
+  head?: string | undefined;
+  cwd?: string | undefined;
+  format: ConfigFormat;
+  output?: string | undefined;
+  task?: string | undefined;
+  ping: boolean;
 }
 
 interface ExecuteOptions {
@@ -223,6 +259,78 @@ interface CliAnalysisContext {
   loadedMemory: LoadedCodeDecayMemory;
 }
 
+interface TrendSnapshot {
+  tool: "CodeDecay";
+  version: string;
+  generatedAt: string;
+  base?: string | undefined;
+  head?: string | undefined;
+  summary: {
+    mergeRiskScore: number;
+    decayScore: number;
+    riskLevel: RiskLevel;
+    changedFiles: number;
+    impactedAreas: number;
+    impactedRoutes: number;
+    findingCounts: Record<RiskLevel, number>;
+    missingTestFindings: number;
+    weakTestFindings: number;
+    evidenceMode: TestEvidenceMode;
+    highRiskFiles: string[];
+    impactedAreaKinds: string[];
+  };
+}
+
+interface TrendSnapshotComparison {
+  tool: "CodeDecay";
+  version: string;
+  generatedAt: string;
+  current: TrendSnapshot;
+  previous: TrendSnapshot;
+  delta: {
+    mergeRiskScore: number;
+    decayScore: number;
+    changedFiles: number;
+    impactedAreas: number;
+    impactedRoutes: number;
+    highFindings: number;
+    mediumFindings: number;
+    lowFindings: number;
+    missingTestFindings: number;
+    weakTestFindings: number;
+  };
+}
+
+interface LlmReviewReport {
+  tool: "CodeDecay";
+  version: string;
+  generatedAt: string;
+  mode: "ping" | "review";
+  configSource?: string | undefined;
+  base?: string | undefined;
+  head?: string | undefined;
+  provider: {
+    id: string;
+    configuredProvider: "disabled" | "ollama" | "litellm";
+    model?: string | undefined;
+    endpoint?: string | undefined;
+    apiKeyEnv?: string | undefined;
+    timeoutMs: number;
+  };
+  summary?: {
+    mergeRiskScore: number;
+    decayScore: number;
+    riskLevel: RiskLevel;
+    changedFiles: number;
+    impactedAreas: number;
+    impactedRoutes: number;
+    evidenceMode: TestEvidenceMode;
+  };
+  suggestions: LlmSuggestion[];
+  rawText: string;
+  untrusted: true;
+}
+
 interface HelpOptionDoc {
   flag: string;
   description: string;
@@ -246,7 +354,7 @@ const VALID_CONFIG_FORMATS = new Set<ConfigFormat>(["json", "markdown"]);
 const VALID_RISK_LEVELS = new Set<RiskLevel>(["low", "medium", "high"]);
 const VALID_PACKAGE_MANAGERS = new Set<PackageManager>(["npm", "pnpm", "yarn", "bun"]);
 const PACKAGE_NAME = "@submuxhq/codedecay";
-const COMMAND_ORDER = ["analyze", "redteam", "agent", "config", "memory", "execute", "differential", "mcp"] as const;
+const COMMAND_ORDER = ["analyze", "snapshot", "redteam", "llm-review", "agent", "config", "memory", "memory-import", "execute", "differential", "mcp"] as const;
 const UTILITY_COMMAND_ORDER = ["help", "man", "update", "uninstall", "version"] as const;
 const ROOT_FLAG_ALIASES = ["--help", "-h", "--version", "-V"] as const;
 const CODEDECAY_PURGE_FILE_PATTERN = /^codedecay(?:[-_.][a-z0-9._-]+)?\.(?:json|md|sarif|txt)$/i;
@@ -285,9 +393,29 @@ const HELP_DOCS: Record<string, CommandDoc> = {
       "Relative --output paths resolve from the analyzed repository root."
     ]
   },
+  snapshot: {
+    name: "snapshot",
+    summary: "Stable repository health snapshot and trend comparison.",
+    usage: ["codedecay snapshot [options]"],
+    description: [
+      "Emit a stable JSON or Markdown snapshot for the current PR or working tree, and optionally compare it with a previous snapshot artifact."
+    ],
+    options: [
+      { flag: "--base <ref>", description: "Base git ref to compare from" },
+      { flag: "--head <ref>", description: "Head git ref to compare to" },
+      { flag: "--cwd <path>", description: "Repository working directory (default: current directory)" },
+      { flag: "--compare <path>", description: "Previous snapshot JSON file to compare against" },
+      { flag: "--format <format>", description: "json or markdown (default: json)" },
+      { flag: "--output <path>", description: "Write snapshot or comparison output to a file instead of stdout" }
+    ],
+    examples: [
+      "codedecay snapshot --format json --output .codedecay/snapshot.json",
+      "codedecay snapshot --base main --head HEAD --compare .codedecay/previous-snapshot.json --format markdown"
+    ]
+  },
   redteam: {
     name: "redteam",
-    summary: "Merge-safety report with impact, weak-test proof, edge cases, and fix tasks.",
+    summary: "Merge-safety report with impact, weak-test evidence, edge cases, and fix tasks.",
     usage: ["codedecay redteam [options]"],
     description: [
       "Produce a deterministic red-team review bundle that packages likely breakage paths, missing tests, edge cases, config context, and local skill context."
@@ -307,6 +435,32 @@ const HELP_DOCS: Record<string, CommandDoc> = {
     notes: [
       "Redteam reports do not execute configured commands or call LLMs by default.",
       "Configured checks are described in the report as recommendations unless you run execute or differential explicitly."
+    ]
+  },
+  "llm-review": {
+    name: "llm-review",
+    summary: "Optional LLM-assisted review suggestions grounded in deterministic analysis.",
+    usage: ["codedecay llm-review [options]"],
+    description: [
+      "Load the configured user-owned LLM provider, ground it in CodeDecay's deterministic PR analysis, and request untrusted review suggestions."
+    ],
+    options: [
+      { flag: "--base <ref>", description: "Base git ref to compare from" },
+      { flag: "--head <ref>", description: "Head git ref to compare to" },
+      { flag: "--cwd <path>", description: "Repository working directory (default: current directory)" },
+      { flag: "--format <format>", description: "json or markdown (default: markdown)" },
+      { flag: "--output <path>", description: "Write the LLM review output to a file instead of stdout" },
+      { flag: "--task <text>", description: "Override the default review task prompt" },
+      { flag: "--ping", description: "Validate provider connectivity without sending PR analysis context" }
+    ],
+    examples: [
+      "codedecay llm-review --ping",
+      "codedecay llm-review --base main --head HEAD --format markdown",
+      "codedecay llm-review --task \"Focus on auth regressions and missing route checks\" --format json"
+    ],
+    notes: [
+      "This command is explicit opt-in. Deterministic analyze, redteam, agent, and snapshot commands do not call models by default.",
+      "LLM suggestions are untrusted until verified by tests, configured checks, or manual review."
     ]
   },
   agent: {
@@ -357,6 +511,24 @@ const HELP_DOCS: Record<string, CommandDoc> = {
       { flag: "--format <format>", description: "json or markdown (default: json)" }
     ],
     examples: ["codedecay memory --format markdown", "codedecay memory --cwd ../my-repo --format json"]
+  },
+  "memory-import": {
+    name: "memory-import",
+    summary: "Merge structured CI, incident, or PR learnings into local repo memory.",
+    usage: ["codedecay memory-import --input <path> [options]"],
+    description: [
+      "Load a structured import file, normalize it into CodeDecay memory sections, preview the merged result, and optionally write it to `.codedecay/memory.json`."
+    ],
+    options: [
+      { flag: "--input <path>", description: "JSON file containing memory sections or imported learnings" },
+      { flag: "--cwd <path>", description: "Repository working directory (default: current directory)" },
+      { flag: "--format <format>", description: "json or markdown preview format (default: markdown)" },
+      { flag: "--apply", description: "Write the merged memory file instead of only printing the preview" }
+    ],
+    examples: [
+      "codedecay memory-import --input .codedecay/import.json",
+      "codedecay memory-import --cwd ../my-repo --input incidents.json --apply"
+    ]
   },
   execute: {
     name: "execute",
@@ -491,9 +663,12 @@ const COMMAND_HANDLERS: Record<string, CliCommandHandler> = {
   config: runConfigCommand,
   differential: runDifferentialCommand,
   execute: runExecuteCommand,
+  "llm-review": runLlmReviewCommand,
   mcp: runMcpCommand,
   memory: runMemoryCommand,
-  redteam: runRedteamCommand
+  "memory-import": runMemoryImportCommand,
+  redteam: runRedteamCommand,
+  snapshot: runSnapshotCommand
 };
 
 if (isDirectRun()) {
@@ -703,6 +878,58 @@ function runMemoryCommand(context: CliCommandContext): void {
   write(context.runtime.stdout, renderMemory(loadedMemory, options.format));
 }
 
+function runMemoryImportCommand(context: CliCommandContext): void {
+  const options = parseMemoryImportArgs(context.args);
+  const cwd = resolve(context.runtimeCwd, options.cwd ?? ".");
+  const rootDir = getRepoRootForCli(cwd, { format: "markdown" });
+  const loadedMemory = loadCodeDecayMemory(rootDir);
+  const inputPath = resolve(context.runtimeCwd, options.input);
+  const rawImport = JSON.parse(readFileSync(inputPath, "utf8"));
+  const imported = importCodeDecayMemory(loadedMemory.memory, rawImport, inputPath);
+  const writtenPath = options.apply ? writeCodeDecayMemory(rootDir, imported.memory) : undefined;
+
+  write(
+    context.runtime.stdout,
+    renderMemoryImportResult({
+      format: options.format,
+      inputPath,
+      writtenPath,
+      result: imported
+    })
+  );
+}
+
+function runSnapshotCommand(context: CliCommandContext): void {
+  const options = parseSnapshotArgs(context.args);
+  const cwd = resolve(context.runtimeCwd, options.cwd ?? ".");
+  const rootDir = getRepoRootForCli(cwd, options);
+  const analysis = createAnalysisContextForCli(rootDir, options);
+  const snapshot = createTrendSnapshot(analysis.report);
+  const rendered = options.compare
+    ? renderTrendSnapshotComparison(createTrendSnapshotComparison(snapshot, loadTrendSnapshot(resolve(context.runtimeCwd, options.compare))), options.format)
+    : renderTrendSnapshot(snapshot, options.format);
+
+  writeCliOutput({
+    cwd,
+    output: options.output,
+    rendered,
+    runtime: context.runtime
+  });
+}
+
+async function runLlmReviewCommand(context: CliCommandContext): Promise<void> {
+  const options = parseLlmReviewArgs(context.args);
+  const cwd = resolve(context.runtimeCwd, options.cwd ?? ".");
+  const report = await createLlmReviewForCli(cwd, options);
+
+  writeCliOutput({
+    cwd,
+    output: options.output,
+    rendered: renderLlmReviewReport(report, options.format),
+    runtime: context.runtime
+  });
+}
+
 async function runExecuteCommand(context: CliCommandContext): Promise<void> {
   const options = parseExecuteArgs(context.args);
   const cwd = resolve(context.runtimeCwd, options.cwd ?? ".");
@@ -813,7 +1040,7 @@ function createRedteamReportForCli(cwd: string, options: AgentOptions | RedteamO
   });
 }
 
-function createAnalysisContextForCli(rootDir: string, options: AnalyzeOptions): CliAnalysisContext {
+function createAnalysisContextForCli(rootDir: string, options: AnalyzeOptions | SnapshotOptions | LlmReviewOptions): CliAnalysisContext {
   const changedFiles = getChangedFilesForCli(rootDir, options);
   const analyzerResult = analyzeJsProject({
     rootDir,
@@ -836,6 +1063,159 @@ function createAnalysisContextForCli(rootDir: string, options: AnalyzeOptions): 
       analyzerResult: analyzerResultWithMemory
     })
   };
+}
+
+async function createLlmReviewForCli(cwd: string, options: LlmReviewOptions): Promise<LlmReviewReport> {
+  const rootDir = getRepoRootForCli(cwd, options);
+  const loadedConfig = loadCodeDecayConfig({ cwd: rootDir });
+  const llmConfig = loadedConfig.config.llm;
+
+  if (llmConfig.provider === "disabled") {
+    throw new Error(
+      'LLM review requires llm.provider to be set to "ollama" or "litellm". See docs/llm-providers.md and run "codedecay config --format markdown" to verify the loaded config.'
+    );
+  }
+
+  let provider;
+  try {
+    provider = createLlmProvider(llmConfig);
+  } catch (error: unknown) {
+    throw formatLlmReviewError(error, llmConfig.provider);
+  }
+
+  let analysis: CliAnalysisContext | undefined;
+  if (!options.ping) {
+    analysis = createAnalysisContextForCli(rootDir, options);
+  }
+
+  let completion: LlmCompletion;
+  try {
+    completion = await provider.complete({
+      task: options.task ?? (options.ping ? "Validate CodeDecay LLM provider connectivity." : "Find overlooked regression risks and stronger verification steps for this pull request."),
+      instructions: options.ping
+        ? "Return JSON when possible with an empty suggestions array. This is a provider connectivity and configuration check."
+        : [
+            "Ground your review in the deterministic CodeDecay evidence below.",
+            "Focus on overlooked regression risks, missing real-world paths, and stronger verification ideas.",
+            "If a route or API boundary is already identified, reason from that boundary instead of giving generic advice.",
+            "Do not propose commands to execute.",
+            "Return at most 8 suggestions as structured JSON when possible."
+          ].join(" "),
+      context: options.ping ? { tool: "CodeDecay", mode: "llm-review-ping" } : summarizeReportForLlmReview(analysis?.report)
+    });
+  } catch (error: unknown) {
+    throw formatLlmReviewError(error, llmConfig.provider);
+  }
+
+  const audit = analysis ? createTestProofAudit(analysis.report) : undefined;
+  const report: LlmReviewReport = {
+    tool: "CodeDecay",
+    version: CODEDECAY_VERSION,
+    generatedAt: new Date().toISOString(),
+    mode: options.ping ? "ping" : "review",
+    provider: {
+      id: completion.providerId,
+      configuredProvider: llmConfig.provider,
+      timeoutMs: llmConfig.timeoutMs
+    },
+    suggestions: completion.suggestions,
+    rawText: completion.text,
+    untrusted: true
+  };
+
+  if (loadedConfig.sourcePath) {
+    report.configSource = loadedConfig.sourcePath;
+  }
+
+  if (analysis?.report.base) {
+    report.base = analysis.report.base;
+  }
+
+  if (analysis?.report.head) {
+    report.head = analysis.report.head;
+  }
+
+  if (completion.model ?? llmConfig.model) {
+    report.provider.model = completion.model ?? llmConfig.model;
+  }
+
+  if (llmConfig.endpoint) {
+    report.provider.endpoint = llmConfig.endpoint;
+  }
+
+  if (llmConfig.apiKeyEnv) {
+    report.provider.apiKeyEnv = llmConfig.apiKeyEnv;
+  }
+
+  if (analysis) {
+    report.summary = {
+      mergeRiskScore: analysis.report.summary.mergeRiskScore,
+      decayScore: analysis.report.summary.decayScore,
+      riskLevel: analysis.report.summary.riskLevel,
+      changedFiles: analysis.report.changedFiles.length,
+      impactedAreas: analysis.report.impactedAreas.length,
+      impactedRoutes: analysis.report.impactedRoutes?.length ?? 0,
+      evidenceMode: audit?.evidenceMode ?? "heuristic_only"
+    };
+  }
+
+  return report;
+}
+
+function summarizeReportForLlmReview(report: CodeDecayReport | undefined): Record<string, unknown> | undefined {
+  if (!report) {
+    return undefined;
+  }
+
+  const testAudit = createTestProofAudit(report);
+  return {
+    summary: {
+      mergeRiskScore: report.summary.mergeRiskScore,
+      decayScore: report.summary.decayScore,
+      riskLevel: report.summary.riskLevel,
+      findingCounts: report.summary.findingCounts,
+      mergeRiskBreakdown: report.summary.mergeRiskBreakdown,
+      decayBreakdown: report.summary.decayBreakdown,
+      testEvidence: report.testEvidence,
+      testAuditStatus: testAudit.status,
+      evidenceMode: testAudit.evidenceMode
+    },
+    changedFiles: report.changedFiles.map((file) => ({
+      path: file.path,
+      status: file.status,
+      additions: file.additions,
+      deletions: file.deletions
+    })),
+    impactedAreas: report.impactedAreas,
+    impactedRoutes: report.impactedRoutes ?? [],
+    findings: report.findings.slice(0, 20),
+    recommendedTests: report.recommendedTests.slice(0, 20)
+  };
+}
+
+function formatLlmReviewError(
+  error: unknown,
+  provider: "disabled" | "ollama" | "litellm"
+): Error {
+  const message = error instanceof Error ? error.message : String(error);
+
+  if (message.includes("llm.model") || message.includes("llm.endpoint")) {
+    return new Error(`${message} Run "codedecay config --format markdown" to verify your llm settings.`);
+  }
+
+  if (message.includes("could not read API key from environment variable")) {
+    return new Error(`${message} Export the configured variable, then rerun "codedecay llm-review --ping".`);
+  }
+
+  if (provider === "ollama" && /fetch support|ECONNREFUSED|request failed|abort/i.test(message)) {
+    return new Error(`${message} Ensure Ollama is running at the configured endpoint and the model is available before rerunning "codedecay llm-review --ping".`);
+  }
+
+  if (provider === "litellm" && /request failed|401|403|404|message content|choices/i.test(message)) {
+    return new Error(`${message} Verify the LiteLLM/OpenAI-compatible endpoint, model name, and API key configuration, then rerun "codedecay llm-review --ping".`);
+  }
+
+  return new Error(message);
 }
 
 function throwUnknownCommand(command: string): never {
@@ -1176,6 +1556,72 @@ function parseMemoryArgs(args: string[]): MemoryOptions {
   return options;
 }
 
+function parseMemoryImportArgs(args: string[]): MemoryImportOptions {
+  const options: MemoryImportOptions = {
+    input: "",
+    format: "markdown",
+    apply: false
+  };
+
+  for (let index = 0; index < args.length; index += 1) {
+    const arg = args[index];
+
+    if (!arg) {
+      continue;
+    }
+
+    if (arg === "--help" || arg === "-h") {
+      throw new HelpRequested();
+    }
+
+    if (arg === "--apply") {
+      options.apply = true;
+      continue;
+    }
+
+    if (arg.startsWith("--cwd=")) {
+      options.cwd = arg.slice("--cwd=".length);
+      continue;
+    }
+
+    if (arg === "--cwd") {
+      options.cwd = requireValue(args, index, arg);
+      index += 1;
+      continue;
+    }
+
+    if (arg.startsWith("--input=")) {
+      options.input = arg.slice("--input=".length);
+      continue;
+    }
+
+    if (arg === "--input") {
+      options.input = requireValue(args, index, arg);
+      index += 1;
+      continue;
+    }
+
+    if (arg.startsWith("--format=")) {
+      options.format = parseConfigFormat(arg.slice("--format=".length));
+      continue;
+    }
+
+    if (arg === "--format") {
+      options.format = parseConfigFormat(requireValue(args, index, arg));
+      index += 1;
+      continue;
+    }
+
+    throwUnknownOption(arg, "memory-import");
+  }
+
+  if (!options.input) {
+    throw new Error('Missing value for --input. Use "codedecay help memory-import" for usage.');
+  }
+
+  return options;
+}
+
 function parseExecuteArgs(args: string[]): ExecuteOptions {
   const options: ExecuteOptions = {
     format: "markdown"
@@ -1303,6 +1749,188 @@ function parseDifferentialArgs(args: string[]): DifferentialOptions {
     }
 
     throwUnknownOption(arg, "differential");
+  }
+
+  return options;
+}
+
+function parseSnapshotArgs(args: string[]): SnapshotOptions {
+  const options: SnapshotOptions = {
+    format: "json"
+  };
+
+  for (let index = 0; index < args.length; index += 1) {
+    const arg = args[index];
+
+    if (!arg) {
+      continue;
+    }
+
+    if (arg === "--help" || arg === "-h") {
+      throw new HelpRequested();
+    }
+
+    if (arg.startsWith("--cwd=")) {
+      options.cwd = arg.slice("--cwd=".length);
+      continue;
+    }
+
+    if (arg === "--cwd") {
+      options.cwd = requireValue(args, index, arg);
+      index += 1;
+      continue;
+    }
+
+    if (arg.startsWith("--base=")) {
+      options.base = arg.slice("--base=".length);
+      continue;
+    }
+
+    if (arg === "--base") {
+      options.base = requireValue(args, index, arg);
+      index += 1;
+      continue;
+    }
+
+    if (arg.startsWith("--head=")) {
+      options.head = arg.slice("--head=".length);
+      continue;
+    }
+
+    if (arg === "--head") {
+      options.head = requireValue(args, index, arg);
+      index += 1;
+      continue;
+    }
+
+    if (arg.startsWith("--compare=")) {
+      options.compare = arg.slice("--compare=".length);
+      continue;
+    }
+
+    if (arg === "--compare") {
+      options.compare = requireValue(args, index, arg);
+      index += 1;
+      continue;
+    }
+
+    if (arg.startsWith("--format=")) {
+      options.format = parseConfigFormat(arg.slice("--format=".length));
+      continue;
+    }
+
+    if (arg === "--format") {
+      options.format = parseConfigFormat(requireValue(args, index, arg));
+      index += 1;
+      continue;
+    }
+
+    if (arg.startsWith("--output=")) {
+      options.output = arg.slice("--output=".length);
+      continue;
+    }
+
+    if (arg === "--output") {
+      options.output = requireValue(args, index, arg);
+      index += 1;
+      continue;
+    }
+
+    throwUnknownOption(arg, "snapshot");
+  }
+
+  return options;
+}
+
+function parseLlmReviewArgs(args: string[]): LlmReviewOptions {
+  const options: LlmReviewOptions = {
+    format: "markdown",
+    ping: false
+  };
+
+  for (let index = 0; index < args.length; index += 1) {
+    const arg = args[index];
+
+    if (!arg) {
+      continue;
+    }
+
+    if (arg === "--help" || arg === "-h") {
+      throw new HelpRequested();
+    }
+
+    if (arg === "--ping") {
+      options.ping = true;
+      continue;
+    }
+
+    if (arg.startsWith("--cwd=")) {
+      options.cwd = arg.slice("--cwd=".length);
+      continue;
+    }
+
+    if (arg === "--cwd") {
+      options.cwd = requireValue(args, index, arg);
+      index += 1;
+      continue;
+    }
+
+    if (arg.startsWith("--base=")) {
+      options.base = arg.slice("--base=".length);
+      continue;
+    }
+
+    if (arg === "--base") {
+      options.base = requireValue(args, index, arg);
+      index += 1;
+      continue;
+    }
+
+    if (arg.startsWith("--head=")) {
+      options.head = arg.slice("--head=".length);
+      continue;
+    }
+
+    if (arg === "--head") {
+      options.head = requireValue(args, index, arg);
+      index += 1;
+      continue;
+    }
+
+    if (arg.startsWith("--format=")) {
+      options.format = parseConfigFormat(arg.slice("--format=".length));
+      continue;
+    }
+
+    if (arg === "--format") {
+      options.format = parseConfigFormat(requireValue(args, index, arg));
+      index += 1;
+      continue;
+    }
+
+    if (arg.startsWith("--output=")) {
+      options.output = arg.slice("--output=".length);
+      continue;
+    }
+
+    if (arg === "--output") {
+      options.output = requireValue(args, index, arg);
+      index += 1;
+      continue;
+    }
+
+    if (arg.startsWith("--task=")) {
+      options.task = arg.slice("--task=".length);
+      continue;
+    }
+
+    if (arg === "--task") {
+      options.task = requireValue(args, index, arg);
+      index += 1;
+      continue;
+    }
+
+    throwUnknownOption(arg, "llm-review");
   }
 
   return options;
@@ -1673,6 +2301,80 @@ function renderConfig(loadedConfig: LoadedCodeDecayConfig, format: ConfigFormat)
   return `${JSON.stringify(loadedConfig, null, 2)}\n`;
 }
 
+function renderLlmReviewReport(report: LlmReviewReport, format: ConfigFormat): string {
+  if (format === "json") {
+    return `${JSON.stringify(report, null, 2)}\n`;
+  }
+
+  const lines = [
+    "## CodeDecay LLM Review",
+    "",
+    `**Mode:** ${report.mode}`,
+    `**Provider:** ${report.provider.id}`,
+    `**Model:** ${report.provider.model ? `\`${report.provider.model}\`` : "unknown"}`,
+    `**Config:** ${report.configSource ? `\`${report.configSource}\`` : "defaults (no config file found)"}`,
+    "",
+    "| Setting | Value |",
+    "| --- | --- |",
+    `| Configured provider | ${report.provider.configuredProvider} |`,
+    `| Endpoint | ${report.provider.endpoint ? `\`${report.provider.endpoint}\`` : "default"} |`,
+    `| API key env | ${report.provider.apiKeyEnv ? `\`${report.provider.apiKeyEnv}\`` : "none"} |`,
+    `| Timeout | ${report.provider.timeoutMs}ms |`,
+    `| Structured suggestions | ${report.suggestions.length} |`,
+    ""
+  ];
+
+  if (report.summary) {
+    lines.push(
+      "### Deterministic Context",
+      "",
+      "| Signal | Value |",
+      "| --- | ---: |",
+      `| Merge risk | ${report.summary.mergeRiskScore}/100 |`,
+      `| Decay risk | ${report.summary.decayScore}/100 |`,
+      `| Risk level | ${report.summary.riskLevel} |`,
+      `| Changed files | ${report.summary.changedFiles} |`,
+      `| Impacted areas | ${report.summary.impactedAreas} |`,
+      `| Impacted routes/APIs | ${report.summary.impactedRoutes} |`,
+      `| Test evidence mode | ${report.summary.evidenceMode === "runtime_augmented" ? "runtime-augmented" : "heuristic-only"} |`,
+      ""
+    );
+  }
+
+  lines.push("### Suggestions", "");
+  if (report.suggestions.length === 0) {
+    lines.push("No structured suggestions were returned.", "");
+  } else {
+    for (const suggestion of report.suggestions) {
+      lines.push(
+        `- **${suggestion.title}**${suggestion.severity ? ` (${suggestion.severity})` : ""}: ${suggestion.detail}`
+      );
+      if (suggestion.evidence && suggestion.evidence.length > 0) {
+        lines.push(`  Evidence: ${suggestion.evidence.join("; ")}`);
+      }
+    }
+    lines.push("");
+  }
+
+  if (report.rawText.trim()) {
+    lines.push("### Raw Provider Response", "", "```text");
+    for (const line of trimLongOutput(report.rawText.trim()).split(/\r?\n/)) {
+      lines.push(line);
+    }
+    lines.push("```", "");
+  }
+
+  lines.push(
+    "### Notes",
+    "",
+    "This command is explicit opt-in and separate from deterministic analyze, redteam, agent, and snapshot workflows.",
+    "LLM suggestions are untrusted until verified by tests, configured checks, or manual review.",
+    ""
+  );
+
+  return `${lines.join("\n")}\n`;
+}
+
 function renderMemory(loadedMemory: LoadedCodeDecayMemory, format: ConfigFormat): string {
   if (format === "json") {
     return `${JSON.stringify(loadedMemory, null, 2)}\n`;
@@ -1693,6 +2395,182 @@ function renderMemory(loadedMemory: LoadedCodeDecayMemory, format: ConfigFormat)
     `| Past regressions | ${memory.regressions.length} |`,
     ""
   ];
+
+  return `${lines.join("\n")}\n`;
+}
+
+function renderMemoryImportResult(input: {
+  format: ConfigFormat;
+  inputPath: string;
+  writtenPath?: string | undefined;
+  result: ReturnType<typeof importCodeDecayMemory>;
+}): string {
+  if (input.format === "json") {
+    return `${JSON.stringify(
+      {
+        tool: "CodeDecay",
+        version: CODEDECAY_VERSION,
+        inputPath: input.inputPath,
+        writtenPath: input.writtenPath,
+        added: input.result.added,
+        merged: input.result.merged,
+        memory: input.result.memory
+      },
+      null,
+      2
+    )}\n`;
+  }
+
+  const lines = [
+    "## CodeDecay Memory Import",
+    "",
+    `**Input:** \`${input.inputPath}\``,
+    `**Applied:** ${input.writtenPath ? "yes" : "no"}`,
+    input.writtenPath ? `**Written to:** \`${input.writtenPath}\`` : "**Written to:** preview only",
+    "",
+    "| Section | Added | Merged |",
+    "| --- | ---: | ---: |",
+    `| Flows | ${input.result.added.flows} | ${input.result.merged.flows} |`,
+    `| Commands | ${input.result.added.commands} | ${input.result.merged.commands} |`,
+    `| Invariants | ${input.result.added.invariants} | ${input.result.merged.invariants} |`,
+    `| Architecture notes | ${input.result.added.architecture} | ${input.result.merged.architecture} |`,
+    `| Past regressions | ${input.result.added.regressions} | ${input.result.merged.regressions} |`,
+    "",
+    renderMemory({ memory: input.result.memory, sourcePath: input.writtenPath }, "markdown").trim(),
+    ""
+  ];
+
+  return `${lines.join("\n")}\n`;
+}
+
+function createTrendSnapshot(report: CodeDecayReport): TrendSnapshot {
+  const audit = createTestProofAudit(report);
+  return {
+    tool: "CodeDecay",
+    version: CODEDECAY_VERSION,
+    generatedAt: new Date().toISOString(),
+    base: report.base,
+    head: report.head,
+    summary: {
+      mergeRiskScore: report.summary.mergeRiskScore,
+      decayScore: report.summary.decayScore,
+      riskLevel: report.summary.riskLevel,
+      changedFiles: report.changedFiles.length,
+      impactedAreas: report.impactedAreas.length,
+      impactedRoutes: report.impactedRoutes?.length ?? 0,
+      findingCounts: report.summary.findingCounts,
+      missingTestFindings: audit.missingTestFindings.length,
+      weakTestFindings: audit.weakTestFindings.length,
+      evidenceMode: audit.evidenceMode,
+      highRiskFiles: [
+        ...new Set(report.findings.filter((finding) => finding.severity === "high" && finding.file).map((finding) => finding.file ?? ""))
+      ].sort((left, right) => left.localeCompare(right)),
+      impactedAreaKinds: [...new Set(report.impactedAreas.map((area) => area.kind))].sort((left, right) => left.localeCompare(right))
+    }
+  };
+}
+
+function createTrendSnapshotComparison(current: TrendSnapshot, previous: TrendSnapshot): TrendSnapshotComparison {
+  return {
+    tool: "CodeDecay",
+    version: CODEDECAY_VERSION,
+    generatedAt: new Date().toISOString(),
+    current,
+    previous,
+    delta: {
+      mergeRiskScore: current.summary.mergeRiskScore - previous.summary.mergeRiskScore,
+      decayScore: current.summary.decayScore - previous.summary.decayScore,
+      changedFiles: current.summary.changedFiles - previous.summary.changedFiles,
+      impactedAreas: current.summary.impactedAreas - previous.summary.impactedAreas,
+      impactedRoutes: current.summary.impactedRoutes - previous.summary.impactedRoutes,
+      highFindings: current.summary.findingCounts.high - previous.summary.findingCounts.high,
+      mediumFindings: current.summary.findingCounts.medium - previous.summary.findingCounts.medium,
+      lowFindings: current.summary.findingCounts.low - previous.summary.findingCounts.low,
+      missingTestFindings: current.summary.missingTestFindings - previous.summary.missingTestFindings,
+      weakTestFindings: current.summary.weakTestFindings - previous.summary.weakTestFindings
+    }
+  };
+}
+
+function loadTrendSnapshot(path: string): TrendSnapshot {
+  const parsed = JSON.parse(readFileSync(path, "utf8")) as TrendSnapshot;
+  if (!parsed || parsed.tool !== "CodeDecay" || !parsed.summary) {
+    throw new Error(`Invalid CodeDecay snapshot: ${path}`);
+  }
+
+  return parsed;
+}
+
+function renderTrendSnapshot(snapshot: TrendSnapshot, format: ConfigFormat): string {
+  if (format === "json") {
+    return `${JSON.stringify(snapshot, null, 2)}\n`;
+  }
+
+  const lines = [
+    "## CodeDecay Snapshot",
+    "",
+    "| Metric | Value |",
+    "| --- | ---: |",
+    `| Merge risk | ${snapshot.summary.mergeRiskScore}/100 |`,
+    `| Decay risk | ${snapshot.summary.decayScore}/100 |`,
+    `| Risk level | ${snapshot.summary.riskLevel} |`,
+    `| Changed files | ${snapshot.summary.changedFiles} |`,
+    `| Impacted areas | ${snapshot.summary.impactedAreas} |`,
+    `| Impacted routes/APIs | ${snapshot.summary.impactedRoutes} |`,
+    `| Missing-test findings | ${snapshot.summary.missingTestFindings} |`,
+    `| Weak-test findings | ${snapshot.summary.weakTestFindings} |`,
+    `| Evidence mode | ${snapshot.summary.evidenceMode === "runtime_augmented" ? "runtime-augmented" : "heuristic-only"} |`,
+    ""
+  ];
+
+  if (snapshot.summary.highRiskFiles.length > 0) {
+    lines.push("High-risk files:");
+    for (const file of snapshot.summary.highRiskFiles) {
+      lines.push(`- \`${file}\``);
+    }
+    lines.push("");
+  }
+
+  if (snapshot.summary.impactedAreaKinds.length > 0) {
+    lines.push(`Impacted area kinds: ${snapshot.summary.impactedAreaKinds.join(", ")}`, "");
+  }
+
+  return `${lines.join("\n")}\n`;
+}
+
+function renderTrendSnapshotComparison(comparison: TrendSnapshotComparison, format: ConfigFormat): string {
+  if (format === "json") {
+    return `${JSON.stringify(comparison, null, 2)}\n`;
+  }
+
+  const lines = [
+    "## CodeDecay Snapshot Comparison",
+    "",
+    "| Metric | Previous | Current | Delta |",
+    "| --- | ---: | ---: | ---: |",
+    `| Merge risk | ${comparison.previous.summary.mergeRiskScore} | ${comparison.current.summary.mergeRiskScore} | ${comparison.delta.mergeRiskScore} |`,
+    `| Decay risk | ${comparison.previous.summary.decayScore} | ${comparison.current.summary.decayScore} | ${comparison.delta.decayScore} |`,
+    `| Changed files | ${comparison.previous.summary.changedFiles} | ${comparison.current.summary.changedFiles} | ${comparison.delta.changedFiles} |`,
+    `| Impacted areas | ${comparison.previous.summary.impactedAreas} | ${comparison.current.summary.impactedAreas} | ${comparison.delta.impactedAreas} |`,
+    `| Impacted routes/APIs | ${comparison.previous.summary.impactedRoutes} | ${comparison.current.summary.impactedRoutes} | ${comparison.delta.impactedRoutes} |`,
+    `| High findings | ${comparison.previous.summary.findingCounts.high} | ${comparison.current.summary.findingCounts.high} | ${comparison.delta.highFindings} |`,
+    `| Weak-test findings | ${comparison.previous.summary.weakTestFindings} | ${comparison.current.summary.weakTestFindings} | ${comparison.delta.weakTestFindings} |`,
+    ""
+  ];
+
+  const previousAreas = new Set(comparison.previous.summary.impactedAreaKinds);
+  const currentAreas = new Set(comparison.current.summary.impactedAreaKinds);
+  const addedAreas = [...currentAreas].filter((area) => !previousAreas.has(area)).sort((left, right) => left.localeCompare(right));
+  const removedAreas = [...previousAreas].filter((area) => !currentAreas.has(area)).sort((left, right) => left.localeCompare(right));
+  if (addedAreas.length > 0) {
+    lines.push(`Added impacted areas: ${addedAreas.join(", ")}`);
+  }
+  if (removedAreas.length > 0) {
+    lines.push(`Removed impacted areas: ${removedAreas.join(", ")}`);
+  }
+  if (addedAreas.length > 0 || removedAreas.length > 0) {
+    lines.push("");
+  }
 
   return `${lines.join("\n")}\n`;
 }
@@ -2377,7 +3255,7 @@ function formatCommandList(commands: string[]): string {
   return commands.map((command) => `\`${command}\``).join("<br>");
 }
 
-function getRepoRootForCli(cwd: string, options: AnalyzeOptions): string {
+function getRepoRootForCli(cwd: string, options: { base?: string | undefined; head?: string | undefined; format: string }): string {
   try {
     return getRepoRoot(cwd);
   } catch (error: unknown) {
@@ -2385,7 +3263,7 @@ function getRepoRootForCli(cwd: string, options: AnalyzeOptions): string {
   }
 }
 
-function getChangedFilesForCli(rootDir: string, options: AnalyzeOptions) {
+function getChangedFilesForCli(rootDir: string, options: { base?: string | undefined; head?: string | undefined; format: string }) {
   try {
     return getGitChangedFiles({
       cwd: rootDir,
@@ -2397,7 +3275,11 @@ function getChangedFilesForCli(rootDir: string, options: AnalyzeOptions) {
   }
 }
 
-function formatGitErrorForCli(error: unknown, cwd: string, options: AnalyzeOptions): Error {
+function formatGitErrorForCli(
+  error: unknown,
+  cwd: string,
+  options: { base?: string | undefined; head?: string | undefined; format: string }
+): Error {
   const message = error instanceof Error ? error.message : String(error);
 
   if (message.includes("rev-parse --show-toplevel") && message.includes("not a git repository")) {
@@ -2414,7 +3296,10 @@ function formatGitErrorForCli(error: unknown, cwd: string, options: AnalyzeOptio
   return error instanceof Error ? error : new Error(message);
 }
 
-function findUnresolvedRef(message: string, options: AnalyzeOptions): string | undefined {
+function findUnresolvedRef(
+  message: string,
+  options: { base?: string | undefined; head?: string | undefined }
+): string | undefined {
   for (const ref of [options.base, options.head]) {
     if (ref && message.includes(ref)) {
       return ref;

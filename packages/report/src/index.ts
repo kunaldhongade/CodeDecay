@@ -1,4 +1,4 @@
-import type { CodeDecayReport, Finding, RiskLevel } from "@submuxhq/codedecay-core";
+import type { CodeDecayReport, Finding, RiskLevel, ScoreBreakdown, TestEvidenceSummary } from "@submuxhq/codedecay-core";
 
 export type ReportFormat = "json" | "markdown" | "sarif";
 
@@ -74,6 +74,10 @@ export function renderMarkdownReport(report: CodeDecayReport): string {
     }
     lines.push("");
   }
+
+  appendScoreBreakdown(lines, "Merge Risk Breakdown", report.summary.mergeRiskBreakdown);
+  appendScoreBreakdown(lines, "Decay Risk Breakdown", report.summary.decayBreakdown);
+  appendTestEvidence(lines, report.testEvidence);
 
   appendFindings(lines, "High Risk Findings", highFindings);
   appendFindings(lines, "Medium Risk Findings", mediumFindings);
@@ -154,7 +158,14 @@ export function renderSarifReport(report: CodeDecayReport): string {
               rules
             }
           },
-          results
+          results,
+          properties: {
+            mergeRiskScore: report.summary.mergeRiskScore,
+            decayScore: report.summary.decayScore,
+            mergeRiskBreakdown: report.summary.mergeRiskBreakdown,
+            decayBreakdown: report.summary.decayBreakdown,
+            testEvidence: report.testEvidence
+          }
         }
       ]
     },
@@ -192,6 +203,82 @@ function appendFindings(lines: string[], title: string, findings: Finding[]): vo
     const location = finding.file ? ` (\`${finding.file}${finding.line ? `:${finding.line}` : ""}\`)` : "";
     lines.push(`- **${finding.title}**${location}: ${finding.description}`);
   }
+  lines.push("");
+}
+
+function appendScoreBreakdown(lines: string[], title: string, breakdown: ScoreBreakdown | undefined): void {
+  if (!breakdown) {
+    return;
+  }
+
+  lines.push(`### ${title}`, "");
+  lines.push(`- Score: ${breakdown.score}/100`);
+  lines.push(`- Raw score before dampeners: ${breakdown.rawScore}/100`);
+  lines.push(`- Adjusted score before severity cap: ${breakdown.adjustedScore}/100`);
+  if (breakdown.highestSeverity) {
+    lines.push(`- Highest contributing severity: ${riskBadge(breakdown.highestSeverity)}`);
+  }
+  if (breakdown.heuristicOnly) {
+    lines.push("- Evidence mode: heuristic-only");
+  }
+  lines.push("");
+
+  if (breakdown.contributors.length > 0) {
+    lines.push("Top contributors:");
+    for (const contributor of breakdown.contributors.slice(0, 5)) {
+      lines.push(`- +${contributor.points} ${contributor.label} (${contributor.evidence}): ${contributor.reason}`);
+    }
+    lines.push("");
+  }
+
+  if (breakdown.dampeners.length > 0) {
+    lines.push("Dampeners:");
+    for (const dampener of breakdown.dampeners.slice(0, 4)) {
+      lines.push(`- ${dampener.points} ${dampener.label}: ${dampener.reason}`);
+    }
+    lines.push("");
+  }
+
+  if (breakdown.notes.length > 0) {
+    lines.push("Notes:");
+    for (const note of breakdown.notes) {
+      lines.push(`- ${note}`);
+    }
+    lines.push("");
+  }
+}
+
+function appendTestEvidence(lines: string[], testEvidence: TestEvidenceSummary | undefined): void {
+  if (!testEvidence) {
+    return;
+  }
+
+  lines.push("### Test Evidence", "");
+  lines.push(`- Mode: ${testEvidence.mode === "runtime_augmented" ? "runtime-augmented" : "heuristic-only"}`);
+  if (testEvidence.sources.length > 0) {
+    lines.push(`- Sources: ${testEvidence.sources.map((source) => `\`${source.path}\` (${source.kind})`).join(", ")}`);
+  } else {
+    lines.push("- Sources: none");
+  }
+
+  if (testEvidence.changedSources.length > 0) {
+    lines.push("- Changed source coverage:");
+    for (const entry of testEvidence.changedSources.slice(0, 8)) {
+      const measured =
+        entry.measuredLines.length > 0
+          ? `measured ${entry.measuredLines.join(", ")}`
+          : "no measurable changed lines";
+      lines.push(`- \`${entry.path}\`: ${entry.status.replaceAll("_", " ")} (${measured})`);
+    }
+  }
+
+  if (testEvidence.notes.length > 0) {
+    lines.push("- Notes:");
+    for (const note of testEvidence.notes) {
+      lines.push(`- ${note}`);
+    }
+  }
+
   lines.push("");
 }
 

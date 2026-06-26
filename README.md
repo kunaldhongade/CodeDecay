@@ -4,18 +4,17 @@
 [![npm](https://img.shields.io/npm/v/@submuxhq/codedecay?label=npm)](https://www.npmjs.com/package/@submuxhq/codedecay)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
-Find what your coding agent missed before merge.
+Catch AI code decay before it reaches main.
 
-CodeDecay is an open-source, local-first PR safety harness for AI-assisted
-development. It analyzes pull requests for regression risk, maintainability
-decay, weak tests, missing edge cases, and user-facing blast radius before code
-is merged.
+CodeDecay is an open-source, deterministic, local-first CLI and GitHub Action
+for PR regression-risk analysis, maintainability decay detection, weak-test
+auditing, and change-impact mapping in AI-assisted development.
 
 It is not a generic AI code reviewer and it is not an AI-authorship detector.
 CodeDecay asks a narrower, more useful question:
 
 ```text
-What could this PR break, and are the tests actually proving it will not?
+What could this PR break, and what evidence says it is safe?
 ```
 
 ## Why CodeDecay
@@ -27,15 +26,15 @@ agents a structured merge-safety pass:
 - map changed files to likely impacted APIs, routes, modules, config, auth, and
   data/schema areas
 - score merge risk and maintainability decay
-- flag missing tests and weak or fake-looking test proof
+- flag missing tests and weak or fake-looking test evidence
 - suggest edge cases and stronger checks
 - package evidence for Codex, Claude Code, Cursor, Pi, OpenCode, desktop
   agents, or MCP-compatible workflows
 - run explicitly configured local checks when the user allows execution
 - compare base/head behavior through configured probes
 
-CodeDecay is useful by itself in deterministic mode. Optional agent, LLM, memory,
-and tool integrations must be user-owned and explicit.
+CodeDecay is useful by itself in deterministic mode. Optional agent, LLM,
+memory, and tool integrations must be user-owned and explicit.
 
 ## Safety Model
 
@@ -52,7 +51,7 @@ The default OSS workflow is intentionally conservative:
 | Deterministic analysis | Yes |
 
 Commands run only through explicit configuration and safety gates. Agent output
-is treated as suggestions, not trusted proof.
+is treated as suggestions, not trusted evidence.
 
 ## Install
 
@@ -112,15 +111,37 @@ Fail CI on high-risk PRs:
 npx codedecay analyze --base main --head HEAD --fail-on high
 ```
 
+Persist a stable trend snapshot:
+
+```bash
+npx codedecay snapshot --format json --output .codedecay/snapshot.json
+```
+
+Preview imported repo memory from incidents or CI learnings:
+
+```bash
+npx codedecay memory-import --input incidents.json
+```
+
+Run an explicit optional LLM-assisted review:
+
+```bash
+npx codedecay llm-review --ping
+npx codedecay llm-review --base main --head HEAD --format markdown
+```
+
 ## Commands
 
 | Command | Purpose |
 | --- | --- |
 | `codedecay analyze` | Deterministic PR risk, impact, and decay analysis. |
-| `codedecay redteam` | Merge-safety report with impact, weak-test proof, edge cases, memory, skills, and fix tasks. |
+| `codedecay snapshot` | Emit a stable repository health snapshot and compare it with a previous snapshot artifact. |
+| `codedecay redteam` | Merge-safety report with impact, weak-test evidence, edge cases, memory, skills, and fix tasks. |
+| `codedecay llm-review` | Explicit opt-in LLM-assisted review suggestions grounded in deterministic CodeDecay analysis. |
 | `codedecay agent` | Portable task bundle for user-owned agents such as Codex, Claude Code, Cursor, Pi, OpenCode, desktop agents, or MCP clients. |
 | `codedecay config` | Inspect normalized CodeDecay config. |
 | `codedecay memory` | Inspect local repo memory from `.codedecay/memory.json`. |
+| `codedecay memory-import` | Preview or apply structured learnings into `.codedecay/memory.json`. |
 | `codedecay execute` | Run explicitly configured local commands and OSS tool adapters. |
 | `codedecay differential` | Run configured probes on base and head and compare behavior. |
 | `codedecay mcp` | Start a local MCP server for agent clients. |
@@ -154,11 +175,21 @@ Utility examples:
 
 ```bash
 codedecay help analyze
+codedecay llm-review --ping
 codedecay man redteam
 codedecay version
 codedecay update
 codedecay uninstall --purge-local
 ```
+
+## Deterministic By Default
+
+| Workflow | Default | What it does today |
+| --- | --- | --- |
+| `codedecay analyze`, `redteam`, `agent`, `snapshot` | Yes | Runs deterministic local analysis with no model calls. |
+| `codedecay execute`, `differential` | No | Runs only repo-allowlisted local commands after explicit opt-in. |
+| `codedecay llm-review` | No | Calls a user-owned provider only when the user invokes it directly. |
+| Optional LLM providers | No | Disabled by default. User-owned providers are configured explicitly and only commands that opt in may call them. |
 
 ## GitHub Action
 
@@ -212,6 +243,7 @@ Current JS/TS analyzer signals include:
 
 - API route changes
 - UI route changes
+- transitive route/API impact through local import chains
 - auth, session, and security-sensitive files
 - database/schema files such as `prisma/schema.prisma`
 - config, build, deployment, and runtime files
@@ -220,10 +252,10 @@ Current JS/TS analyzer signals include:
 - duplicated logic
 - test bloat
 - fragile abstractions
-- weak tests, missing nearby tests, and low-confidence test proof
+- weak tests, missing nearby tests, and low-confidence test evidence
 
 The analyzer is intentionally conservative. Findings are review signals, not
-proof that a bug exists.
+guarantees that a bug exists or that a fix is safe.
 
 ## Red-Team Workflow
 
@@ -238,7 +270,7 @@ Then give `codedecay-agent.md` to your preferred agent and ask it to:
 
 1. inspect the changed files and impacted routes/APIs
 2. explain what real user/API/database path could break
-3. add tests that prove the real path, not only mocked helper behavior
+3. add tests that exercise the real path, not only mocked helper behavior
 4. cover missing edge cases
 5. run relevant configured checks
 6. rerun CodeDecay
@@ -325,11 +357,25 @@ Reports include:
 
 - `mergeRiskScore`: immediate regression/blast-radius risk
 - `decayScore`: maintainability decay risk
+- `mergeRiskBreakdown` and `decayBreakdown`: top contributors, evidence type,
+  and any dampeners
+- `testEvidence`: whether test coverage signals are heuristic-only or
+  runtime-backed
 - grouped low/medium/high findings
 - impacted areas and routes/APIs
 - recommended tests and checks
 
-See [Scoring model](docs/scoring.md).
+See [Scoring model](docs/scoring.md) and
+[Benchmark corpus](docs/benchmark-corpus.md).
+
+## Compatibility
+
+CodeDecay is still pre-`1.0`. The CLI command names and repo-local config file
+shape aim to stay stable within a minor line, but report fields can still grow
+before `v1`. Pin CI integrations to an explicit package version or GitHub
+Action ref and review upgrade notes when moving across minor releases.
+
+See [Release policy](docs/release-policy.md).
 
 ## Repository Layout
 
@@ -352,7 +398,7 @@ packages/
   redteam/          merge-safety report assembly
   report/           JSON, Markdown, SARIF rendering
   skills/           repo-local agent skill loading
-  test-audit/       weak-test and missing-test proof signals
+  test-audit/       weak-test and missing-test evidence signals
   tool-adapters/    Playwright, StrykerJS, Schemathesis, Pact adapters
 docs/               user docs, RFCs, sample reports
 .agents/            contributor agent commands and skills
@@ -377,9 +423,11 @@ keeps the wiki `Home` and sidebar aligned with the docs site.
 - [Getting started](docs/getting-started.md)
 - [Configuration](docs/configuration.md)
 - [Development setup](DEVELOPMENT.md)
+- [Editor workflows](docs/editor-workflows.md)
+- [Trend snapshots](docs/trend-snapshots.md)
 - [Local repo memory](docs/memory.md)
 - [Agent skills](docs/skills.md)
-- [Test proof audit](docs/test-audit.md)
+- [Test evidence audit](docs/test-audit.md)
 - [Tool adapters](docs/tool-adapters.md)
 - [Execution probes](docs/execution.md)
 - [Differential behavior checks](docs/differential.md)
@@ -391,9 +439,12 @@ keeps the wiki `Home` and sidebar aligned with the docs site.
 - [GitHub App](docs/github-app.md)
 - [Sample reports](docs/sample-reports/index.md)
 - [Scoring model](docs/scoring.md)
+- [Benchmark corpus](docs/benchmark-corpus.md)
+- [Deployment surfaces](docs/deployment-surfaces.md)
 - [Framework-aware impact map proposal](docs/proposals/framework-aware-impact-map.md)
 - [Agent-agnostic redteam harness RFC](docs/rfcs/0001-agent-agnostic-redteam-harness.md)
 - [Research basis](docs/research.md)
+- [Release policy](docs/release-policy.md)
 - [Releasing](docs/releasing.md)
 
 ## Contributing

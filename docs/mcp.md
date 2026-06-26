@@ -1,9 +1,9 @@
 # MCP Server
 
 CodeDecay can run as a local Model Context Protocol server so agent clients can
-ask it for PR risk, impact maps, weak-test audits, and deterministic edge-case
-suggestions. It can also run explicitly configured local checks when the caller
-confirms execution.
+ask it for PR risk, impact maps, weak-test audits, score breakdowns, runtime
+test evidence, and deterministic edge-case suggestions. It can also run
+explicitly configured local checks when the caller confirms execution.
 
 The MCP server calls local CodeDecay analysis only. It does not call an LLM,
 does not require API keys, and does not send telemetry. Command execution is
@@ -36,7 +36,7 @@ runs CodeDecay locally and passes the repository path with `--cwd`.
 - `analyze_pr`: returns a Markdown or JSON CodeDecay report.
 - `impact_map`: returns changed files, impacted areas, and concrete route/API
   impacts when CodeDecay can detect them.
-- `audit_tests`: returns missing-test and weak-test proof findings plus
+- `audit_tests`: returns missing-test and weak-test evidence findings plus
   recommended checks.
 - `suggest_edge_cases`: returns deterministic edge-case suggestions.
 - `redteam_report`: returns a deterministic merge-safety report for your agent,

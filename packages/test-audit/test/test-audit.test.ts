@@ -3,7 +3,7 @@ import { createAnalysisReport, type AnalyzerResult, type FileChange } from "@sub
 import { createTestProofAudit, missingTestRuleIds, weakTestRuleIds } from "../src/index";
 
 describe("createTestProofAudit", () => {
-  it("marks source changes without test changes as missing proof", () => {
+  it("marks source changes without test changes as missing evidence", () => {
     const audit = createTestProofAudit(
       createReport({
         changedFiles: [sourceChange("src/api/users.ts")],
@@ -26,6 +26,8 @@ describe("createTestProofAudit", () => {
     );
 
     expect(audit.status).toBe("missing");
+    expect(audit.evidenceMode).toBe("heuristic_only");
+    expect(audit.evidenceSummary).toContain("Heuristic-only audit");
     expect(audit.changedSourceFiles).toEqual(["src/api/users.ts"]);
     expect(audit.changedTestFiles).toEqual([]);
     expect(audit.missingTestFindings.map((finding) => finding.ruleId)).toEqual(["missing-nearby-tests"]);
@@ -34,7 +36,7 @@ describe("createTestProofAudit", () => {
     );
   });
 
-  it("marks changed tests with weak signals as weak proof", () => {
+  it("marks changed tests with weak signals as weak evidence", () => {
     const audit = createTestProofAudit(
       createReport({
         changedFiles: [sourceChange("src/auth/session.ts"), testChange("src/auth/session.test.ts")],
@@ -57,6 +59,7 @@ describe("createTestProofAudit", () => {
     );
 
     expect(audit.status).toBe("weak");
+    expect(audit.summary).toContain("weak test-evidence signals");
     expect(audit.weakTestFindings.map((finding) => finding.ruleId)).toEqual(["test-without-assertions"]);
     expect(audit.recommendedChecks).toEqual(
       expect.arrayContaining([
@@ -66,7 +69,7 @@ describe("createTestProofAudit", () => {
     );
   });
 
-  it("marks changed tests without weak signals as present proof", () => {
+  it("marks changed tests without weak signals as present evidence", () => {
     const audit = createTestProofAudit(
       createReport({
         changedFiles: [sourceChange("src/auth/session.ts"), testChange("src/auth/session.test.ts")],
@@ -79,6 +82,7 @@ describe("createTestProofAudit", () => {
     );
 
     expect(audit.status).toBe("present");
+    expect(audit.evidenceMode).toBe("heuristic_only");
     expect(audit.summary).toContain("Changed tests are present");
     expect(audit.weakTestFindings).toEqual([]);
     expect(audit.recommendedChecks).toContain(
@@ -132,6 +136,40 @@ describe("createTestProofAudit", () => {
 
     expect(audit.status).toBe("not_applicable");
     expect(audit.recommendedChecks).toEqual([]);
+  });
+
+  it("treats runtime coverage as stronger evidence than changed-test proximity alone", () => {
+    const audit = createTestProofAudit(
+      createReport({
+        changedFiles: [sourceChange("src/api/users.ts")],
+        analyzerResult: {
+          impactedAreas: [],
+          findings: [],
+          recommendedTests: [],
+          testEvidence: {
+            mode: "runtime_augmented",
+            sources: [{ kind: "istanbul", path: "coverage/coverage-final.json" }],
+            changedSources: [
+              {
+                path: "src/api/users.ts",
+                status: "covered",
+                measuredLines: [1],
+                coveredLines: [1],
+                uncoveredLines: [],
+                sourceKinds: ["istanbul"],
+                sourcePaths: ["coverage/coverage-final.json"]
+              }
+            ],
+            notes: ["Runtime coverage artifacts were found for the changed source files."]
+          }
+        }
+      })
+    );
+
+    expect(audit.status).toBe("present");
+    expect(audit.evidenceMode).toBe("runtime_augmented");
+    expect(audit.evidenceSummary).toContain("Covered: 1");
+    expect(audit.runtimeCoverage[0]?.status).toBe("covered");
   });
 
   it("exports stable rule id lists", () => {

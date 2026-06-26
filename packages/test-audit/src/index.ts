@@ -1,4 +1,10 @@
-import type { CodeDecayReport, FileChange, Finding } from "@submuxhq/codedecay-core";
+import type {
+  ChangedSourceCoverage,
+  CodeDecayReport,
+  FileChange,
+  Finding,
+  TestEvidenceMode
+} from "@submuxhq/codedecay-core";
 import { dedupeStrings, sortFindings } from "@submuxhq/codedecay-core";
 
 export type TestProofStatus = "missing" | "weak" | "present" | "not_applicable";
@@ -6,8 +12,11 @@ export type TestProofStatus = "missing" | "weak" | "present" | "not_applicable";
 export interface TestProofAudit {
   status: TestProofStatus;
   summary: string;
+  evidenceMode: TestEvidenceMode;
+  evidenceSummary: string;
   changedSourceFiles: string[];
   changedTestFiles: string[];
+  runtimeCoverage: ChangedSourceCoverage[];
   missingTestFindings: Finding[];
   weakTestFindings: Finding[];
   recommendedChecks: string[];
@@ -37,20 +46,26 @@ export function createTestProofAudit(report: CodeDecayReport): TestProofAudit {
     .filter((change) => change.status !== "deleted" && isTestPath(change.path))
     .map((change) => change.path)
     .sort((left, right) => left.localeCompare(right));
+  const runtimeCoverage = (report.testEvidence?.changedSources ?? []).filter((entry) => changedSourceFiles.includes(entry.path));
   const missingTestFindings = sortFindings(report.findings.filter((finding) => MISSING_TEST_RULES.has(finding.ruleId)));
   const weakTestFindings = sortFindings(report.findings.filter((finding) => WEAK_TEST_RULES.has(finding.ruleId)));
   const status = classifyTestProof({
     changedSourceFiles,
     changedTestFiles,
+    runtimeCoverage,
     missingTestFindings,
     weakTestFindings
   });
+  const evidenceMode = report.testEvidence?.mode ?? "heuristic_only";
 
   return {
     status,
-    summary: summarizeStatus(status),
+    summary: summarizeStatus(status, evidenceMode),
+    evidenceMode,
+    evidenceSummary: summarizeEvidence(evidenceMode, runtimeCoverage),
     changedSourceFiles,
     changedTestFiles,
+    runtimeCoverage,
     missingTestFindings,
     weakTestFindings,
     recommendedChecks: recommendStrongerChecks({
@@ -58,6 +73,7 @@ export function createTestProofAudit(report: CodeDecayReport): TestProofAudit {
       status,
       changedSourceFiles,
       changedTestFiles,
+      runtimeCoverage,
       missingTestFindings,
       weakTestFindings
     })
@@ -75,11 +91,27 @@ export function missingTestRuleIds(): string[] {
 function classifyTestProof(input: {
   changedSourceFiles: string[];
   changedTestFiles: string[];
+  runtimeCoverage: ChangedSourceCoverage[];
   missingTestFindings: Finding[];
   weakTestFindings: Finding[];
 }): TestProofStatus {
-  if (input.changedSourceFiles.length === 0 && input.changedTestFiles.length === 0) {
+  if (input.changedSourceFiles.length === 0 && input.changedTestFiles.length === 0 && input.runtimeCoverage.length === 0) {
     return "not_applicable";
+  }
+
+  if (input.runtimeCoverage.some((entry) => entry.status === "not_covered")) {
+    return "missing";
+  }
+
+  if (input.runtimeCoverage.some((entry) => entry.status === "partial")) {
+    return "weak";
+  }
+
+  if (input.runtimeCoverage.length > 0 && input.changedSourceFiles.length > 0) {
+    const measuredSourceCount = input.runtimeCoverage.filter((entry) => entry.status !== "not_measured").length;
+    if (measuredSourceCount === input.changedSourceFiles.length) {
+      return input.weakTestFindings.length > 0 ? "weak" : "present";
+    }
   }
 
   if (input.missingTestFindings.length > 0 || (input.changedSourceFiles.length > 0 && input.changedTestFiles.length === 0)) {
@@ -93,20 +125,38 @@ function classifyTestProof(input: {
   return "present";
 }
 
-function summarizeStatus(status: TestProofStatus): string {
+function summarizeStatus(status: TestProofStatus, evidenceMode: TestEvidenceMode): string {
   if (status === "missing") {
-    return "Changed source behavior does not have nearby changed test proof.";
+    return evidenceMode === "runtime_augmented"
+      ? "Changed source behavior is missing runtime-backed test evidence for at least one changed path."
+      : "Changed source behavior does not have enough nearby test evidence.";
   }
 
   if (status === "weak") {
-    return "Changed tests exist, but deterministic rules found weak proof signals.";
+    return evidenceMode === "runtime_augmented"
+      ? "Changed behavior has partial runtime coverage or weak deterministic test signals."
+      : "Changed tests exist, but deterministic rules found weak test-evidence signals.";
   }
 
   if (status === "present") {
-    return "Changed tests are present and no deterministic weak-test signals were found.";
+    return evidenceMode === "runtime_augmented"
+      ? "Runtime coverage artifacts include the changed source lines and no weak deterministic signals were found."
+      : "Changed tests are present and no deterministic weak-test signals were found.";
   }
 
-  return "No changed source or test files require a test proof audit.";
+  return "No changed source or test files require a test-evidence audit.";
+}
+
+function summarizeEvidence(mode: TestEvidenceMode, runtimeCoverage: ChangedSourceCoverage[]): string {
+  if (mode === "heuristic_only") {
+    return "Heuristic-only audit. No runtime coverage artifact was found for changed source files.";
+  }
+
+  const covered = runtimeCoverage.filter((entry) => entry.status === "covered").length;
+  const partial = runtimeCoverage.filter((entry) => entry.status === "partial").length;
+  const missing = runtimeCoverage.filter((entry) => entry.status === "not_covered").length;
+  const notMeasured = runtimeCoverage.filter((entry) => entry.status === "not_measured").length;
+  return `Runtime coverage artifacts were found. Covered: ${covered}, partial: ${partial}, uncovered: ${missing}, not measured: ${notMeasured}.`;
 }
 
 function recommendStrongerChecks(input: {
@@ -114,6 +164,7 @@ function recommendStrongerChecks(input: {
   status: TestProofStatus;
   changedSourceFiles: string[];
   changedTestFiles: string[];
+  runtimeCoverage: ChangedSourceCoverage[];
   missingTestFindings: Finding[];
   weakTestFindings: Finding[];
 }): string[] {
@@ -127,6 +178,17 @@ function recommendStrongerChecks(input: {
 
   for (const finding of [...input.missingTestFindings, ...input.weakTestFindings]) {
     checks.push(strongerCheckForFinding(finding));
+  }
+
+  for (const entry of input.runtimeCoverage) {
+    if (entry.status === "not_covered") {
+      checks.push(`Run or add tests that execute the changed lines in ${entry.path}.`);
+    }
+
+    if (entry.status === "partial") {
+      const uncovered = entry.uncoveredLines.length > 0 ? ` (${entry.uncoveredLines.join(", ")})` : "";
+      checks.push(`Add runtime coverage for uncovered changed lines in ${entry.path}${uncovered}.`);
+    }
   }
 
   checks.push(...input.report.recommendedTests.filter(isTestProofRecommendation).map(normalizeRecommendedCheck));

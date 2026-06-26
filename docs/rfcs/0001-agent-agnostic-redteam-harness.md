@@ -25,7 +25,7 @@ audits, and runtime checks so your agent can find what it missed before merge.
 Core question:
 
 ```text
-What could this PR break, and are the tests actually proving it will not?
+What could this PR break, and what evidence says it is safe?
 ```
 
 ## Product Boundaries

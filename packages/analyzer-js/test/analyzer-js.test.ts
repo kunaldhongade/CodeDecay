@@ -210,6 +210,44 @@ describe("analyzeJsProject", () => {
     expect(result.impactedRoutes?.some((route) => route.files.includes("src/lib/format.ts"))).toBe(false);
   });
 
+  it("propagates changed utility files to importing route boundaries", () => {
+    const rootDir = createTempProject({
+      "src/lib/session.ts": "export function loadSession() { return null; }\n",
+      "src/server/session-service.ts": "import { loadSession } from '../lib/session';\nexport function getSession() { return loadSession(); }\n",
+      "src/app/api/session/route.ts": "import { getSession } from '../../../server/session-service';\nexport async function GET() { return Response.json({ ok: Boolean(getSession()) }); }\n"
+    });
+
+    const result = analyzeJsProject({
+      rootDir,
+      changedFiles: [change("src/lib/session.ts", "export function loadSession() { return { userId: '1' }; }")]
+    });
+
+    expect(result.findings).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          ruleId: "propagated-route-impact",
+          file: "src/lib/session.ts"
+        })
+      ])
+    );
+    expect(result.impactedRoutes).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          framework: "nextjs",
+          kind: "api-route",
+          route: "/api/session",
+          files: expect.arrayContaining(["src/app/api/session/route.ts", "src/lib/session.ts"]),
+          reasons: expect.arrayContaining([
+            expect.stringContaining("src/lib/session.ts -> src/server/session-service.ts -> src/app/api/session/route.ts")
+          ])
+        })
+      ])
+    );
+    expect(result.recommendedTests).toContain(
+      "Add or run tests covering src/app/api/session/route.ts because it depends on src/lib/session.ts"
+    );
+  });
+
   it("extracts Express and Fastify route impacts from changed route handlers", () => {
     const rootDir = createTempProject({
       "src/routes/users.ts": [
@@ -542,6 +580,121 @@ describe("analyzeJsProject", () => {
 
     expect(result.findings.map((finding) => finding.ruleId)).toContain("unrelated-test-change");
     expect(result.recommendedTests).toContain("Add or update tests that exercise src/api/users.ts");
+  });
+
+  it("treats Istanbul coverage artifacts as runtime-backed evidence", () => {
+    const rootDir = createTempProject({
+      "src/api/users.ts": "export function listUsers() { return []; }\n"
+    });
+    mkdirSync(dirname(join(rootDir, "coverage/coverage-final.json")), { recursive: true });
+    writeFileSync(
+      join(rootDir, "coverage/coverage-final.json"),
+      JSON.stringify(
+        {
+          [join(rootDir, "src/api/users.ts")]: {
+            path: join(rootDir, "src/api/users.ts"),
+            statementMap: {
+              "0": {
+                start: { line: 1, column: 0 },
+                end: { line: 1, column: 39 }
+              }
+            },
+            s: { "0": 1 }
+          }
+        },
+        null,
+        2
+      )
+    );
+
+    const result = analyzeJsProject({
+      rootDir,
+      changedFiles: [change("src/api/users.ts", "export function listUsers() { return []; }")]
+    });
+
+    expect(result.findings.map((finding) => finding.ruleId)).not.toContain("missing-nearby-tests");
+    expect(result.findings.map((finding) => finding.ruleId)).not.toContain("runtime-coverage-miss");
+    expect(result.testEvidence?.mode).toBe("runtime_augmented");
+    expect(result.testEvidence?.changedSources[0]?.status).toBe("covered");
+  });
+
+  it("flags partially covered changed lines from lcov artifacts", () => {
+    const rootDir = createTempProject({
+      "src/api/users.ts": ["export function listUsers() {", "  return [];", "}", ""].join("\n")
+    });
+    mkdirSync(dirname(join(rootDir, "coverage/lcov.info")), { recursive: true });
+    writeFileSync(
+      join(rootDir, "coverage/lcov.info"),
+      [
+        `SF:${join(rootDir, "src/api/users.ts")}`,
+        "DA:1,1",
+        "DA:2,0",
+        "end_of_record",
+        ""
+      ].join("\n")
+    );
+
+    const result = analyzeJsProject({
+      rootDir,
+      changedFiles: [
+        {
+          path: "src/api/users.ts",
+          status: "modified",
+          additions: 2,
+          deletions: 0,
+          addedLines: [
+            { line: 1, content: "export function listUsers() {" },
+            { line: 2, content: "  return [];" }
+          ]
+        }
+      ]
+    });
+
+    expect(result.findings.map((finding) => finding.ruleId)).toContain("runtime-coverage-partial");
+    expect(result.testEvidence?.changedSources[0]?.status).toBe("partial");
+  });
+
+  it("loads V8 coverage artifacts for changed source files", () => {
+    const fileContents = ["export function listUsers() {", "  return [];", "}", ""].join("\n");
+    const rootDir = createTempProject({
+      "src/api/users.ts": fileContents
+    });
+    const firstLineEnd = fileContents.indexOf("\n");
+    mkdirSync(dirname(join(rootDir, ".v8-coverage/run.json")), { recursive: true });
+    writeFileSync(
+      join(rootDir, ".v8-coverage/run.json"),
+      JSON.stringify(
+        {
+          result: [
+            {
+              url: join(rootDir, "src/api/users.ts"),
+              functions: [
+                {
+                  ranges: [
+                    {
+                      startOffset: 0,
+                      endOffset: firstLineEnd,
+                      count: 1
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        },
+        null,
+        2
+      )
+    );
+
+    const result = analyzeJsProject({
+      rootDir,
+      changedFiles: [change("src/api/users.ts", "export function listUsers() {")]
+    });
+
+    expect(result.testEvidence?.mode).toBe("runtime_augmented");
+    expect(result.testEvidence?.sources).toEqual(expect.arrayContaining([expect.objectContaining({ kind: "v8" })]));
+    expect(result.testEvidence?.changedSources[0]?.status).toBe("covered");
   });
 
   it("flags tests that copy implementation logic", () => {

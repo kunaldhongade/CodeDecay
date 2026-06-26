@@ -43,9 +43,13 @@ export default defineConfig({
         items: [
           { text: "Docs Home", link: "/" },
           { text: "Getting Started", link: "/getting-started" },
+          { text: "Editor Workflows", link: "/editor-workflows" },
+          { text: "Trend Snapshots", link: "/trend-snapshots" },
           { text: "GitHub Action", link: "/github-action" },
           { text: "Sample Reports", link: "/sample-reports/" },
           { text: "Scoring Model", link: "/scoring" },
+          { text: "Benchmark Corpus", link: "/benchmark-corpus" },
+          { text: "Release Policy", link: "/release-policy" },
           { text: "Research Basis", link: "/research" }
         ]
       },
@@ -64,7 +68,8 @@ export default defineConfig({
           { text: "Tool Adapters", link: "/tool-adapters" },
           { text: "Agent Skills", link: "/skills" },
           { text: "Local Repo Memory", link: "/memory" },
-          { text: "LLM Providers", link: "/llm-providers" }
+          { text: "LLM Providers", link: "/llm-providers" },
+          { text: "Deployment Surfaces", link: "/deployment-surfaces" }
         ]
       },
       {

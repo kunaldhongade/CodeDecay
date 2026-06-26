@@ -17,7 +17,8 @@ The bundle includes:
 
 - a copy-paste prompt for any user-owned coding agent
 - changed files, impacted areas, and concrete route/API impacts when available
-- weak-test and missing-test proof signals
+- weak-test and missing-test evidence signals
+- merge-risk and decay-risk breakdowns plus runtime test evidence, when present
 - edge cases to check
 - configured checks and tool adapters that are available but not run
 - tasks for the coding agent
@@ -67,9 +68,12 @@ After changes, tell me what checks to run.
 ```
 
 For JSON consumers, route/API evidence is available under
-`evidence.impactedRoutes`. Treat it as tool evidence for the agent's fix plan:
-the agent should map each proposed fix back to the changed file, route/API, weak
-test signal, and missing edge case it addresses.
+`evidence.impactedRoutes`. Score contributors are available under
+`evidence.summary.mergeRiskBreakdown` and `evidence.summary.decayBreakdown`, and
+runtime-backed coverage state is available under `evidence.testEvidence`. Treat
+these as tool evidence for the agent's fix plan: the agent should map each
+proposed fix back to the changed file, route/API, score contributor, weak test
+signal, and missing edge case it addresses.
 
 ## Safety
 

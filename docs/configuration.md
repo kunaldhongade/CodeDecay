@@ -82,6 +82,8 @@ Current behavior:
 
 - `codedecay analyze` does not require config.
 - `codedecay config` only loads and prints config.
+- `codedecay llm-review` is the explicit opt-in path that can call the
+  configured user-owned LLM provider.
 - `codedecay redteam` lists configured tool adapters as planned local checks,
   but does not run them.
 - `codedecay execute` runs only commands and probes from config, and only when

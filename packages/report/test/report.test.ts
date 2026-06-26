@@ -16,6 +16,52 @@ const report: CodeDecayReport = {
       low: 0,
       medium: 1,
       high: 1
+    },
+    mergeRiskBreakdown: {
+      score: 72,
+      rawScore: 78,
+      adjustedScore: 72,
+      highestSeverity: "high",
+      heuristicOnly: false,
+      contributors: [
+        {
+          id: "risky-auth-change:src/auth/session.ts:3",
+          label: "Auth changed",
+          points: 30,
+          evidence: "direct",
+          reason: "Auth behavior changed.",
+          category: "regression",
+          severity: "high",
+          ruleId: "risky-auth-change",
+          file: "src/auth/session.ts",
+          line: 3
+        }
+      ],
+      dampeners: [],
+      notes: []
+    },
+    decayBreakdown: {
+      score: 44,
+      rawScore: 44,
+      adjustedScore: 44,
+      highestSeverity: "medium",
+      heuristicOnly: false,
+      contributors: [
+        {
+          id: "high-complexity:src/auth/session.ts:3",
+          label: "High complexity",
+          points: 16,
+          evidence: "heuristic",
+          reason: "Complexity increased.",
+          category: "decay",
+          severity: "medium",
+          ruleId: "high-complexity",
+          file: "src/auth/session.ts",
+          line: 3
+        }
+      ],
+      dampeners: [],
+      notes: []
     }
   },
   changedFiles: [
@@ -68,7 +114,23 @@ const report: CodeDecayReport = {
       line: 3
     }
   ],
-  recommendedTests: ["src/auth/session.test.ts", "Add or run tests covering next.config.js"]
+  recommendedTests: ["src/auth/session.test.ts", "Add or run tests covering next.config.js"],
+  testEvidence: {
+    mode: "runtime_augmented",
+    sources: [{ kind: "istanbul", path: "coverage/coverage-final.json" }],
+    changedSources: [
+      {
+        path: "src/auth/session.ts",
+        status: "partial",
+        measuredLines: [3, 4],
+        coveredLines: [3],
+        uncoveredLines: [4],
+        sourceKinds: ["istanbul"],
+        sourcePaths: ["coverage/coverage-final.json"]
+      }
+    ],
+    notes: ["Runtime coverage artifacts were found, but some changed paths were not measured: src/app/dashboard/page.tsx."]
+  }
 };
 
 describe("reports", () => {
@@ -79,6 +141,8 @@ describe("reports", () => {
     expect(markdown).toContain("Merge risk");
     expect(markdown).toContain("src/auth/session.ts");
     expect(markdown).toContain("### Likely Impacted Routes And APIs");
+    expect(markdown).toContain("### Merge Risk Breakdown");
+    expect(markdown).toContain("### Test Evidence");
     expect(markdown).toContain("High `GET /api/session` (Next.js API route)");
     expect(markdown).toContain("Medium `/dashboard` (Next.js UI route)");
     expect(markdown).toContain("- `src/auth/session.test.ts`");
@@ -112,5 +176,6 @@ describe("reports", () => {
     expect(sarif.runs[0].tool.driver.informationUri).toBe("https://github.com/SubmuxHQ/CodeDecay");
     expect(sarif.runs[0].results[0].ruleId).toBe("risky-auth-change");
     expect(sarif.runs[0].results[0].locations[0].physicalLocation.region.startLine).toBe(3);
+    expect(sarif.runs[0].properties.mergeRiskBreakdown.score).toBe(72);
   });
 });
