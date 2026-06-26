@@ -1,7 +1,10 @@
+import { existsSync, readFileSync } from "node:fs";
+import { isAbsolute, join, relative, resolve } from "node:path";
 import type {
   CodeDecayCommandToolAdapter,
   CodeDecayConfig,
-  CodeDecaySchemathesisToolAdapter
+  CodeDecaySchemathesisToolAdapter,
+  CodeDecayStrykerToolAdapter
 } from "@submuxhq/codedecay-config";
 import { runConfiguredCommand, type CommandExecutionResult } from "@submuxhq/codedecay-execution";
 import {
@@ -27,6 +30,7 @@ export interface PlaywrightHarnessOptions {
 
 export interface StrykerHarnessOptions {
   command?: string | undefined;
+  reportPath?: string | undefined;
   timeoutMs?: number | undefined;
   allowCommands?: boolean | undefined;
   allowUnsafeCommands?: boolean | undefined;
@@ -67,6 +71,7 @@ const DEFAULT_PLAYWRIGHT_TIMEOUT_MS = 120_000;
 const STRYKER_HARNESS_NAME = "stryker";
 const DEFAULT_STRYKER_COMMAND = "pnpm exec stryker run";
 const DEFAULT_STRYKER_TIMEOUT_MS = 300_000;
+const DEFAULT_STRYKER_REPORT_PATH = "reports/mutation/mutation.json";
 const SCHEMATHESIS_HARNESS_NAME = "schemathesis";
 const DEFAULT_SCHEMATHESIS_SCHEMA = "openapi.yaml";
 const DEFAULT_SCHEMATHESIS_BASE_URL = "http://127.0.0.1:3000";
@@ -238,16 +243,7 @@ export function createConfiguredToolHarnesses(config: CodeDecayConfig): Configur
   }
 
   if (config.toolAdapters.stryker?.enabled) {
-    configured.push(
-      createConfiguredCommandHarness({
-        kind: "stryker",
-        name: "StrykerJS",
-        adapter: config.toolAdapters.stryker,
-        defaultCommand: DEFAULT_STRYKER_COMMAND,
-        create: createStrykerHarness,
-        allowCommands: config.safety.allowCommands
-      })
-    );
+    configured.push(createConfiguredStrykerHarness(config.toolAdapters.stryker, config.safety.allowCommands));
   }
 
   if (config.toolAdapters.schemathesis?.enabled) {
@@ -297,6 +293,38 @@ function createConfiguredCommandHarness(input: {
 
   if (input.adapter.timeoutMs !== undefined) {
     configured.timeoutMs = input.adapter.timeoutMs;
+  }
+
+  return configured;
+}
+
+function createConfiguredStrykerHarness(
+  adapter: CodeDecayStrykerToolAdapter,
+  allowCommands: boolean
+): ConfiguredToolHarness {
+  const command = adapter.command ?? DEFAULT_STRYKER_COMMAND;
+  const options: StrykerHarnessOptions = {
+    command,
+    allowCommands
+  };
+
+  if (adapter.timeoutMs !== undefined) {
+    options.timeoutMs = adapter.timeoutMs;
+  }
+
+  if (adapter.reportPath !== undefined) {
+    options.reportPath = adapter.reportPath;
+  }
+
+  const configured: ConfiguredToolHarness = {
+    kind: "stryker",
+    name: "StrykerJS",
+    command,
+    harness: createStrykerHarness(options)
+  };
+
+  if (adapter.timeoutMs !== undefined) {
+    configured.timeoutMs = adapter.timeoutMs;
   }
 
   return configured;
@@ -482,20 +510,47 @@ async function runStrykerPlan(
     }
   });
   const durationMs = elapsed(startedAt);
-  const evidence = [strykerEvidenceFromExecution(execution)];
+  const mutationReport = analyzeStrykerMutationReport(context.cwd, options.reportPath ?? DEFAULT_STRYKER_REPORT_PATH);
+  const evidence = [
+    strykerEvidenceFromExecution(execution),
+    ...strykerEvidenceFromReport(mutationReport, options.command)
+  ];
+  const artifacts = mutationReport?.reportPath
+    ? [
+        {
+          path: mutationReport.reportPath,
+          description: "StrykerJS mutation testing report."
+        }
+      ]
+    : [];
 
   if (execution.status === "passed") {
+    if (mutationReport?.parseError || (mutationReport && mutationReport.weakMutants.length > 0)) {
+      const failed = createHarnessFailureResult({
+        harnessName: STRYKER_HARNESS_NAME,
+        mode: mutationReport.parseError ? "internal-error" : "no-evidence",
+        message: mutationReport.parseError ?? strykerReportFailureMessage(mutationReport),
+        status: "failed",
+        durationMs,
+        evidence
+      });
+      return {
+        ...failed,
+        artifacts
+      };
+    }
+
     return {
       harnessName: STRYKER_HARNESS_NAME,
       status: "passed",
       durationMs,
       evidence,
-      artifacts: [],
+      artifacts,
       summary: "StrykerJS mutation checks passed."
     };
   }
 
-  return createHarnessFailureResult({
+  const failed = createHarnessFailureResult({
     harnessName: STRYKER_HARNESS_NAME,
     mode: failureModeFromExecution(execution),
     message: strykerFailureMessageFromExecution(execution),
@@ -503,6 +558,10 @@ async function runStrykerPlan(
     durationMs,
     evidence
   });
+  return {
+    ...failed,
+    artifacts
+  };
 }
 
 async function runSchemathesisPlan(
@@ -619,6 +678,210 @@ function strykerEvidenceFromExecution(execution: CommandExecutionResult): Eviden
     command: execution.command,
     metadata: compactExecutionMetadata(execution)
   });
+}
+
+interface StrykerMutationReportAnalysis {
+  reportPath: string;
+  totalMutants: number;
+  survivedMutants: number;
+  noCoverageMutants: number;
+  weakMutants: StrykerWeakMutant[];
+  mutationScore?: number | undefined;
+  parseError?: string | undefined;
+}
+
+interface StrykerWeakMutant {
+  id?: string | undefined;
+  file: string;
+  line?: number | undefined;
+  status: "Survived" | "NoCoverage";
+  mutatorName?: string | undefined;
+  replacement?: string | undefined;
+  statusReason?: string | undefined;
+}
+
+function analyzeStrykerMutationReport(
+  cwd: string,
+  reportPath: string
+): StrykerMutationReportAnalysis | undefined {
+  const absolutePath = isAbsolute(reportPath) ? reportPath : join(cwd, reportPath);
+  if (!existsSync(absolutePath)) {
+    return undefined;
+  }
+
+  const normalizedReportPath = normalizeArtifactPath(cwd, absolutePath);
+
+  try {
+    const parsed = JSON.parse(readFileSync(absolutePath, "utf8"));
+    return summarizeStrykerMutationReport(parsed, cwd, normalizedReportPath);
+  } catch (error: unknown) {
+    const message = error instanceof Error ? error.message : String(error);
+    return {
+      reportPath: normalizedReportPath,
+      totalMutants: 0,
+      survivedMutants: 0,
+      noCoverageMutants: 0,
+      weakMutants: [],
+      parseError: `Could not parse StrykerJS mutation report at ${normalizedReportPath}: ${message}`
+    };
+  }
+}
+
+function summarizeStrykerMutationReport(
+  value: unknown,
+  cwd: string,
+  reportPath: string
+): StrykerMutationReportAnalysis {
+  const files = isPlainObject(value) && isPlainObject(value.files) ? value.files : {};
+  const weakMutants: StrykerWeakMutant[] = [];
+  let totalMutants = 0;
+  let survivedMutants = 0;
+  let noCoverageMutants = 0;
+
+  for (const [filePath, fileReport] of Object.entries(files)) {
+    if (!isPlainObject(fileReport) || !Array.isArray(fileReport.mutants)) {
+      continue;
+    }
+
+    const normalizedFile = normalizeArtifactPath(cwd, filePath);
+    for (const mutant of fileReport.mutants) {
+      if (!isPlainObject(mutant)) {
+        continue;
+      }
+
+      totalMutants += 1;
+      const status = normalizeStrykerMutantStatus(mutant.status);
+      if (!status) {
+        continue;
+      }
+
+      if (status === "Survived") {
+        survivedMutants += 1;
+      } else {
+        noCoverageMutants += 1;
+      }
+
+      weakMutants.push({
+        id: optionalStringValue(mutant.id),
+        file: normalizedFile,
+        line: readMutantStartLine(mutant.location),
+        status,
+        mutatorName: optionalStringValue(mutant.mutatorName),
+        replacement: optionalStringValue(mutant.replacement),
+        statusReason: optionalStringValue(mutant.statusReason)
+      });
+    }
+  }
+
+  return {
+    reportPath,
+    totalMutants,
+    survivedMutants,
+    noCoverageMutants,
+    weakMutants: weakMutants.sort((left, right) => `${left.file}:${left.line ?? 0}`.localeCompare(`${right.file}:${right.line ?? 0}`)),
+    mutationScore: readMutationScore(value)
+  };
+}
+
+function strykerEvidenceFromReport(
+  report: StrykerMutationReportAnalysis | undefined,
+  command: string
+): Evidence[] {
+  if (!report) {
+    return [];
+  }
+
+  if (report.parseError) {
+    return [
+      createEvidence({
+        source: { kind: "tool", name: "StrykerJS", id: "stryker" },
+        kind: "mutation",
+        severity: "high",
+        summary: report.parseError,
+        trusted: true,
+        command,
+        artifactPath: report.reportPath,
+        metadata: {
+          reportPath: report.reportPath
+        }
+      })
+    ];
+  }
+
+  const summaryEvidence = createEvidence({
+    source: { kind: "tool", name: "StrykerJS", id: "stryker" },
+    kind: "mutation",
+    severity: report.weakMutants.length > 0 ? "high" : "info",
+    summary:
+      report.weakMutants.length > 0
+        ? `StrykerJS found ${report.weakMutants.length} surviving or no-coverage mutant(s) in ${new Set(report.weakMutants.map((mutant) => mutant.file)).size} file(s).`
+        : "StrykerJS report found no surviving or no-coverage mutants.",
+    trusted: true,
+    command,
+    artifactPath: report.reportPath,
+    metadata: compactStrykerReportMetadata(report)
+  });
+
+  return [
+    summaryEvidence,
+    ...report.weakMutants.slice(0, 5).map((mutant) =>
+      createEvidence({
+        source: { kind: "tool", name: "StrykerJS", id: "stryker" },
+        kind: "mutation",
+        severity: "high",
+        summary: `${mutant.status} ${mutant.mutatorName ?? "mutation"} mutant in ${mutant.file}${mutant.line ? `:${mutant.line}` : ""}.`,
+        trusted: true,
+        file: mutant.file,
+        line: mutant.line,
+        command,
+        artifactPath: report.reportPath,
+        metadata: compactMutantMetadata(mutant)
+      })
+    )
+  ];
+}
+
+function strykerReportFailureMessage(report: StrykerMutationReportAnalysis): string {
+  return `StrykerJS found ${report.weakMutants.length} surviving or no-coverage mutant(s). Strengthen tests before merge.`;
+}
+
+function compactStrykerReportMetadata(report: StrykerMutationReportAnalysis): Record<string, unknown> {
+  const metadata: Record<string, unknown> = {
+    reportPath: report.reportPath,
+    totalMutants: report.totalMutants,
+    survivedMutants: report.survivedMutants,
+    noCoverageMutants: report.noCoverageMutants
+  };
+
+  if (report.mutationScore !== undefined) {
+    metadata.mutationScore = report.mutationScore;
+  }
+
+  return metadata;
+}
+
+function compactMutantMetadata(mutant: StrykerWeakMutant): Record<string, unknown> {
+  const metadata: Record<string, unknown> = {
+    status: mutant.status
+  };
+
+  if (mutant.id) {
+    metadata.id = mutant.id;
+  }
+
+  if (mutant.mutatorName) {
+    metadata.mutatorName = mutant.mutatorName;
+  }
+
+  if (mutant.replacement) {
+    metadata.replacement = mutant.replacement;
+  }
+
+  if (mutant.statusReason) {
+    metadata.statusReason = mutant.statusReason;
+  }
+
+  return metadata;
 }
 
 function schemathesisEvidenceFromExecution(execution: CommandExecutionResult): Evidence {
@@ -862,6 +1125,56 @@ function pactFailureMessageFromExecution(execution: CommandExecutionResult): str
   return pactEvidenceSummaryFromExecution(execution);
 }
 
+function normalizeStrykerMutantStatus(value: unknown): "Survived" | "NoCoverage" | undefined {
+  if (typeof value !== "string") {
+    return undefined;
+  }
+
+  const normalized = value.toLowerCase().replace(/[\s_-]/g, "");
+  if (normalized === "survived") {
+    return "Survived";
+  }
+
+  if (normalized === "nocoverage") {
+    return "NoCoverage";
+  }
+
+  return undefined;
+}
+
+function readMutantStartLine(value: unknown): number | undefined {
+  if (!isPlainObject(value) || !isPlainObject(value.start)) {
+    return undefined;
+  }
+
+  return typeof value.start.line === "number" && Number.isFinite(value.start.line)
+    ? value.start.line
+    : undefined;
+}
+
+function readMutationScore(value: unknown): number | undefined {
+  if (!isPlainObject(value) || !isPlainObject(value.thresholds)) {
+    return undefined;
+  }
+
+  const score = value.thresholds.mutationScore;
+  return typeof score === "number" && Number.isFinite(score) ? score : undefined;
+}
+
+function normalizeArtifactPath(cwd: string, path: string): string {
+  const absolutePath = isAbsolute(path) ? path : resolve(cwd, path);
+  const relativePath = relative(cwd, absolutePath).replaceAll("\\", "/");
+  return relativePath.startsWith("..") ? absolutePath.replaceAll("\\", "/") : relativePath;
+}
+
+function optionalStringValue(value: unknown): string | undefined {
+  return typeof value === "string" && value.trim().length > 0 ? value : undefined;
+}
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
 function validatePlaywrightOptions(options: PlaywrightHarnessOptions & { command: string }): void {
   validateNonEmptyString(options.command, "Playwright command");
 
@@ -876,6 +1189,10 @@ function validatePlaywrightOptions(options: PlaywrightHarnessOptions & { command
 
 function validateStrykerOptions(options: StrykerHarnessOptions & { command: string }): void {
   validateNonEmptyString(options.command, "StrykerJS command");
+
+  if (options.reportPath !== undefined) {
+    validateNonEmptyString(options.reportPath, "StrykerJS reportPath");
+  }
 
   if (options.timeoutMs !== undefined && (!Number.isInteger(options.timeoutMs) || options.timeoutMs <= 0)) {
     throw new Error("StrykerJS timeoutMs must be a positive integer.");

@@ -39,6 +39,30 @@ describe("public risk benchmark corpus", () => {
       expectedRules: ["risky-docs-change"]
     },
     {
+      id: "assets-only-change",
+      setup: createAssetsOnlyRepo,
+      expectedRiskLevel: "low",
+      mergeRiskMin: 0,
+      mergeRiskMax: 9,
+      expectedRules: []
+    },
+    {
+      id: "lockfile-only-change",
+      setup: createLockfileOnlyRepo,
+      expectedRiskLevel: "low",
+      mergeRiskMin: 0,
+      mergeRiskMax: 19,
+      expectedRules: ["risky-config-change"]
+    },
+    {
+      id: "package-metadata-only-change",
+      setup: createPackageMetadataOnlyRepo,
+      expectedRiskLevel: "low",
+      mergeRiskMin: 0,
+      mergeRiskMax: 19,
+      expectedRules: ["risky-config-change"]
+    },
+    {
       id: "api-handler-behavior-change",
       setup: createMediumRiskRepo,
       expectedRiskLevel: "medium",
@@ -120,6 +144,48 @@ function createBroadLowOnlyRepo(): string {
     writeFile(repo, file, `export const fixture = ${JSON.stringify(file)};\n`);
   }
 
+  return repo;
+}
+
+function createAssetsOnlyRepo(): string {
+  const repo = createRepo({
+    "README.md": "# Project\n"
+  });
+
+  writeFile(repo, "public/logo.svg", "<svg viewBox=\"0 0 24 24\"><path d=\"M1 1h22v22H1z\" /></svg>\n");
+  writeFile(repo, "public/fonts/display.woff2", "font fixture\n");
+  return repo;
+}
+
+function createLockfileOnlyRepo(): string {
+  const repo = createRepo({
+    "package.json": JSON.stringify({ name: "demo", version: "1.0.0" }, null, 2),
+    "pnpm-lock.yaml": "lockfileVersion: '9.0'\n"
+  });
+
+  writeFile(repo, "pnpm-lock.yaml", "lockfileVersion: '9.0'\nsettings:\n  autoInstallPeers: true\n");
+  return repo;
+}
+
+function createPackageMetadataOnlyRepo(): string {
+  const repo = createRepo({
+    "package.json": JSON.stringify({ name: "demo", version: "1.0.0" }, null, 2)
+  });
+
+  writeFile(
+    repo,
+    "package.json",
+    JSON.stringify(
+      {
+        name: "demo",
+        version: "1.0.0",
+        description: "Deterministic pull request risk analysis.",
+        keywords: ["static-analysis", "pull-request"]
+      },
+      null,
+      2
+    )
+  );
   return repo;
 }
 

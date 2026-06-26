@@ -34,6 +34,7 @@ import { createLlmProvider, type LlmCompletion, type LlmSuggestion } from "@subm
 import {
   applyMemoryContext,
   importCodeDecayMemory,
+  learnCodeDecayMemory,
   loadCodeDecayMemory,
   writeCodeDecayMemory,
   type LoadedCodeDecayMemory
@@ -77,6 +78,13 @@ interface MemoryOptions {
 }
 
 interface MemoryImportOptions {
+  cwd?: string | undefined;
+  input: string;
+  format: ConfigFormat;
+  apply: boolean;
+}
+
+interface MemoryLearnOptions {
   cwd?: string | undefined;
   input: string;
   format: ConfigFormat;
@@ -354,7 +362,7 @@ const VALID_CONFIG_FORMATS = new Set<ConfigFormat>(["json", "markdown"]);
 const VALID_RISK_LEVELS = new Set<RiskLevel>(["low", "medium", "high"]);
 const VALID_PACKAGE_MANAGERS = new Set<PackageManager>(["npm", "pnpm", "yarn", "bun"]);
 const PACKAGE_NAME = "@submuxhq/codedecay";
-const COMMAND_ORDER = ["analyze", "snapshot", "redteam", "llm-review", "agent", "config", "memory", "memory-import", "execute", "differential", "mcp"] as const;
+const COMMAND_ORDER = ["analyze", "snapshot", "redteam", "llm-review", "agent", "config", "memory", "memory-import", "memory-learn", "execute", "differential", "mcp"] as const;
 const UTILITY_COMMAND_ORDER = ["help", "man", "update", "uninstall", "version"] as const;
 const ROOT_FLAG_ALIASES = ["--help", "-h", "--version", "-V"] as const;
 const CODEDECAY_PURGE_FILE_PATTERN = /^codedecay(?:[-_.][a-z0-9._-]+)?\.(?:json|md|sarif|txt)$/i;
@@ -530,6 +538,27 @@ const HELP_DOCS: Record<string, CommandDoc> = {
       "codedecay memory-import --cwd ../my-repo --input incidents.json --apply"
     ]
   },
+  "memory-learn": {
+    name: "memory-learn",
+    summary: "Learn local repo memory from CI, PR, and CodeDecay report signals.",
+    usage: ["codedecay memory-learn --input <path> [options]"],
+    description: [
+      "Convert raw-ish CI failures, merged PR descriptions, commit messages, and CodeDecay fail-on reports into reviewable `.codedecay/memory.json` entries."
+    ],
+    options: [
+      { flag: "--input <path>", description: "JSON file containing ciFailures, pullRequests, reports, failOnReports, or a CodeDecay report" },
+      { flag: "--cwd <path>", description: "Repository working directory (default: current directory)" },
+      { flag: "--format <format>", description: "json or markdown preview format (default: markdown)" },
+      { flag: "--apply", description: "Write the learned memory file instead of only printing the preview" }
+    ],
+    examples: [
+      "codedecay memory-learn --input ci-failure.json",
+      "codedecay memory-learn --input codedecay-report.json --apply"
+    ],
+    notes: [
+      "Learning is deterministic and local. CodeDecay does not inspect remote CI, PRs, or GitHub automatically."
+    ]
+  },
   execute: {
     name: "execute",
     summary: "Run explicitly configured local checks and tool adapters.",
@@ -667,6 +696,7 @@ const COMMAND_HANDLERS: Record<string, CliCommandHandler> = {
   mcp: runMcpCommand,
   memory: runMemoryCommand,
   "memory-import": runMemoryImportCommand,
+  "memory-learn": runMemoryLearnCommand,
   redteam: runRedteamCommand,
   snapshot: runSnapshotCommand
 };
@@ -895,6 +925,27 @@ function runMemoryImportCommand(context: CliCommandContext): void {
       inputPath,
       writtenPath,
       result: imported
+    })
+  );
+}
+
+function runMemoryLearnCommand(context: CliCommandContext): void {
+  const options = parseMemoryLearnArgs(context.args);
+  const cwd = resolve(context.runtimeCwd, options.cwd ?? ".");
+  const rootDir = getRepoRootForCli(cwd, { format: "markdown" });
+  const loadedMemory = loadCodeDecayMemory(rootDir);
+  const inputPath = resolve(context.runtimeCwd, options.input);
+  const rawLearning = JSON.parse(readFileSync(inputPath, "utf8"));
+  const learned = learnCodeDecayMemory(loadedMemory.memory, rawLearning, inputPath);
+  const writtenPath = options.apply ? writeCodeDecayMemory(rootDir, learned.memory) : undefined;
+
+  write(
+    context.runtime.stdout,
+    renderMemoryLearnResult({
+      format: options.format,
+      inputPath,
+      writtenPath,
+      result: learned
     })
   );
 }
@@ -1617,6 +1668,72 @@ function parseMemoryImportArgs(args: string[]): MemoryImportOptions {
 
   if (!options.input) {
     throw new Error('Missing value for --input. Use "codedecay help memory-import" for usage.');
+  }
+
+  return options;
+}
+
+function parseMemoryLearnArgs(args: string[]): MemoryLearnOptions {
+  const options: MemoryLearnOptions = {
+    input: "",
+    format: "markdown",
+    apply: false
+  };
+
+  for (let index = 0; index < args.length; index += 1) {
+    const arg = args[index];
+
+    if (!arg) {
+      continue;
+    }
+
+    if (arg === "--help" || arg === "-h") {
+      throw new HelpRequested();
+    }
+
+    if (arg === "--apply") {
+      options.apply = true;
+      continue;
+    }
+
+    if (arg.startsWith("--cwd=")) {
+      options.cwd = arg.slice("--cwd=".length);
+      continue;
+    }
+
+    if (arg === "--cwd") {
+      options.cwd = requireValue(args, index, arg);
+      index += 1;
+      continue;
+    }
+
+    if (arg.startsWith("--input=")) {
+      options.input = arg.slice("--input=".length);
+      continue;
+    }
+
+    if (arg === "--input") {
+      options.input = requireValue(args, index, arg);
+      index += 1;
+      continue;
+    }
+
+    if (arg.startsWith("--format=")) {
+      options.format = parseConfigFormat(arg.slice("--format=".length));
+      continue;
+    }
+
+    if (arg === "--format") {
+      options.format = parseConfigFormat(requireValue(args, index, arg));
+      index += 1;
+      continue;
+    }
+
+    throwUnknownOption(arg, "memory-learn");
+  }
+
+  if (!options.input) {
+    throw new Error('Missing value for --input. Use "codedecay help memory-learn" for usage.');
   }
 
   return options;
@@ -2443,6 +2560,51 @@ function renderMemoryImportResult(input: {
   return `${lines.join("\n")}\n`;
 }
 
+function renderMemoryLearnResult(input: {
+  format: ConfigFormat;
+  inputPath: string;
+  writtenPath?: string | undefined;
+  result: ReturnType<typeof learnCodeDecayMemory>;
+}): string {
+  if (input.format === "json") {
+    return `${JSON.stringify(
+      {
+        tool: "CodeDecay",
+        version: CODEDECAY_VERSION,
+        inputPath: input.inputPath,
+        writtenPath: input.writtenPath,
+        learned: input.result.learned,
+        added: input.result.added,
+        merged: input.result.merged,
+        memory: input.result.memory
+      },
+      null,
+      2
+    )}\n`;
+  }
+
+  const lines = [
+    "## CodeDecay Memory Learn",
+    "",
+    `**Input:** \`${input.inputPath}\``,
+    `**Applied:** ${input.writtenPath ? "yes" : "no"}`,
+    input.writtenPath ? `**Written to:** \`${input.writtenPath}\`` : "**Written to:** preview only",
+    "",
+    "| Section | Learned | Added | Merged |",
+    "| --- | ---: | ---: | ---: |",
+    `| Flows | ${input.result.learned.flows} | ${input.result.added.flows} | ${input.result.merged.flows} |`,
+    `| Commands | ${input.result.learned.commands} | ${input.result.added.commands} | ${input.result.merged.commands} |`,
+    `| Invariants | ${input.result.learned.invariants} | ${input.result.added.invariants} | ${input.result.merged.invariants} |`,
+    `| Architecture notes | ${input.result.learned.architecture} | ${input.result.added.architecture} | ${input.result.merged.architecture} |`,
+    `| Past regressions | ${input.result.learned.regressions} | ${input.result.added.regressions} | ${input.result.merged.regressions} |`,
+    "",
+    renderMemory({ memory: input.result.memory, sourcePath: input.writtenPath }, "markdown").trim(),
+    ""
+  ];
+
+  return `${lines.join("\n")}\n`;
+}
+
 function createTrendSnapshot(report: CodeDecayReport): TrendSnapshot {
   const audit = createTestProofAudit(report);
   return {
@@ -3238,6 +3400,7 @@ function formatConfigToolAdapter(
 
   const details = [
     adapter.command ? `command: \`${adapter.command}\`` : "command: default",
+    "reportPath" in adapter && adapter.reportPath ? `reportPath: \`${adapter.reportPath}\`` : undefined,
     "schema" in adapter && adapter.schema ? `schema: \`${adapter.schema}\`` : undefined,
     "baseUrl" in adapter && adapter.baseUrl ? `baseUrl: \`${adapter.baseUrl}\`` : undefined
   ]

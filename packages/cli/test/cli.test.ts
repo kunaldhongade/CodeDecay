@@ -634,6 +634,75 @@ describe("codedecay memory CLI contract", () => {
     expect(parsed.memory.regressions).toEqual(expect.arrayContaining([expect.objectContaining({ title: "Anonymous admin" })]));
     expect(parsed.memory.commands).toEqual(expect.arrayContaining([expect.objectContaining({ name: "Billing rollout check" })]));
   });
+
+  it("learns memory from CI, PR, and CodeDecay report inputs", async () => {
+    const repo = createLowRiskRepo();
+    const inputPath = join(repo, "memory-learn.json");
+    writeFile(
+      repo,
+      "memory-learn.json",
+      JSON.stringify(
+        {
+          ciFailures: [
+            {
+              title: "Auth smoke failed",
+              message: "Token refresh returned 401 after deploy.",
+              command: "pnpm test auth",
+              files: ["src/auth/session.ts"]
+            }
+          ],
+          pullRequests: [
+            {
+              title: "fix: auth token not refreshing on 401",
+              body: "Restores session refresh for expired access tokens.",
+              commits: ["fix auth retry path"],
+              changedFiles: ["src/app/api/session/route.ts"],
+              checks: ["expired token refresh"]
+            }
+          ],
+          reports: [
+            {
+              tool: "CodeDecay",
+              findings: [
+                {
+                  ruleId: "missing-nearby-tests",
+                  title: "Risky source changes without changed tests",
+                  description: "Auth source changed without a test update.",
+                  severity: "high",
+                  file: "src/auth/session.ts"
+                }
+              ],
+              impactedAreas: [{ kind: "auth" }],
+              recommendedTests: ["Add missing-token auth regression test"]
+            }
+          ]
+        },
+        null,
+        2
+      )
+    );
+
+    const preview = await run(["memory-learn", "--input", inputPath], repo);
+    expect(preview.exitCode).toBe(0);
+    expect(preview.stdout).toContain("## CodeDecay Memory Learn");
+    expect(preview.stdout).toContain("preview only");
+    expect(preview.stdout).toContain("| Past regressions | 3 | 3 | 0 |");
+
+    const applied = await run(["memory-learn", "--input", inputPath, "--apply", "--format", "json"], repo);
+    const parsed = JSON.parse(applied.stdout);
+    expect(applied.exitCode).toBe(0);
+    expect(parsed.writtenPath).toContain(".codedecay/memory.json");
+    expect(parsed.learned.regressions).toBe(3);
+    expect(parsed.memory.commands).toEqual(
+      expect.arrayContaining([expect.objectContaining({ name: "Auth smoke failed check", command: "pnpm test auth" })])
+    );
+    expect(parsed.memory.regressions).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ title: "Auth smoke failed" }),
+        expect.objectContaining({ title: "CodeDecay: Risky source changes without changed tests" })
+      ])
+    );
+  });
 });
 
 describe("codedecay snapshot CLI contract", () => {
@@ -1167,6 +1236,79 @@ describe("codedecay execute CLI contract", () => {
     expect(markdown.stdout).toContain("### Tool Adapter Results");
     expect(markdown.stdout).toContain("Playwright");
     expect(markdown.stdout).toContain("browser-flow");
+  });
+
+  it("surfaces StrykerJS survivor evidence from configured mutation reports", async () => {
+    const repo = createLowRiskRepo();
+    writeFile(repo, "stryker-pass.js", "console.log('mutation done');\n");
+    writeFile(
+      repo,
+      "reports/mutation/mutation.json",
+      JSON.stringify(
+        {
+          files: {
+            "src/math.ts": {
+              mutants: [
+                {
+                  id: "1",
+                  status: "Survived",
+                  mutatorName: "ArithmeticOperator",
+                  location: { start: { line: 4, column: 2 }, end: { line: 4, column: 10 } }
+                }
+              ]
+            }
+          }
+        },
+        null,
+        2
+      )
+    );
+    writeFile(
+      repo,
+      ".codedecay/config.yml",
+      [
+        "version: 1",
+        "commands: {}",
+        "probes: []",
+        "toolAdapters:",
+        "  stryker:",
+        "    command: node stryker-pass.js",
+        "    reportPath: reports/mutation/mutation.json",
+        "safety:",
+        "  allowCommands: true",
+        "  commandTimeoutMs: 1000",
+        ""
+      ].join("\n")
+    );
+
+    const result = await run(["execute", "--format", "json"], repo);
+    const report = JSON.parse(result.stdout);
+
+    expect(result.exitCode).toBe(1);
+    expect(report.summary).toMatchObject({
+      status: "failed",
+      total: 1,
+      failed: 1
+    });
+    expect(report.toolAdapters[0]).toMatchObject({
+      kind: "stryker",
+      status: "failed",
+      failure: {
+        mode: "no-evidence"
+      }
+    });
+    expect(report.toolAdapters[0].evidence).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          kind: "mutation",
+          severity: "high",
+          summary: "Survived ArithmeticOperator mutant in src/math.ts:4.",
+          file: "src/math.ts",
+          line: 4,
+          artifactPath: "reports/mutation/mutation.json"
+        })
+      ])
+    );
   });
 
   it("returns exit 1 and reports failures from configured tool adapters", async () => {

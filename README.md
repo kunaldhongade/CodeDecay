@@ -121,6 +121,7 @@ Preview imported repo memory from incidents or CI learnings:
 
 ```bash
 npx codedecay memory-import --input incidents.json
+npx codedecay memory-learn --input ci-failure.json
 ```
 
 Run an explicit optional LLM-assisted review:
@@ -142,6 +143,7 @@ npx codedecay llm-review --base main --head HEAD --format markdown
 | `codedecay config` | Inspect normalized CodeDecay config. |
 | `codedecay memory` | Inspect local repo memory from `.codedecay/memory.json`. |
 | `codedecay memory-import` | Preview or apply structured learnings into `.codedecay/memory.json`. |
+| `codedecay memory-learn` | Learn local memory from CI, PR, and CodeDecay report signals. |
 | `codedecay execute` | Run explicitly configured local commands and OSS tool adapters. |
 | `codedecay differential` | Run configured probes on base and head and compare behavior. |
 | `codedecay mcp` | Start a local MCP server for agent clients. |

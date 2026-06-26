@@ -68,6 +68,7 @@ describe("loadCodeDecayConfig", () => {
         "  stryker:",
         "    command: pnpm exec stryker run",
         "    timeoutMs: 300000",
+        "    reportPath: reports/mutation/mutation.json",
         "  schemathesis:",
         "    schema: docs/openapi.yaml",
         "    baseUrl: http://127.0.0.1:4000",
@@ -111,7 +112,8 @@ describe("loadCodeDecayConfig", () => {
         stryker: {
           enabled: true,
           command: "pnpm exec stryker run",
-          timeoutMs: 300000
+          timeoutMs: 300000,
+          reportPath: "reports/mutation/mutation.json"
         },
         schemathesis: {
           enabled: true,
@@ -199,6 +201,13 @@ describe("loadCodeDecayConfig", () => {
     writeFile(root, ".codedecay/config.yml", "version: 1\ntoolAdapters:\n  pact:\n    timeoutMs: 0\n");
 
     expect(() => loadCodeDecayConfig({ cwd: root })).toThrow(/toolAdapters.pact.timeoutMs must be a positive integer/);
+  });
+
+  it("fails clearly for invalid Stryker report paths", () => {
+    const root = createTempDir();
+    writeFile(root, ".codedecay/config.yml", "version: 1\ntoolAdapters:\n  stryker:\n    reportPath: ''\n");
+
+    expect(() => loadCodeDecayConfig({ cwd: root })).toThrow(/toolAdapters.stryker.reportPath must be a non-empty string/);
   });
 });
 

@@ -23,6 +23,7 @@ toolAdapters:
   playwright: true
   stryker:
     command: pnpm exec stryker run
+    reportPath: reports/mutation/mutation.json
   schemathesis:
     schema: docs/openapi.yaml
     baseUrl: http://127.0.0.1:3000
@@ -72,6 +73,7 @@ The StrykerJS harness is also a private internal package API for now:
 ```ts
 createStrykerHarness({
   command: "pnpm exec stryker run",
+  reportPath: "reports/mutation/mutation.json",
   allowCommands: true
 });
 ```
@@ -92,6 +94,26 @@ pnpm exec stryker run
 
 Projects can override the command when they already have their own Stryker
 script, mutation score threshold, or package manager setup.
+
+When `reportPath` exists, CodeDecay parses the StrykerJS JSON mutation report
+after command execution. Surviving and no-coverage mutants become concrete
+`mutation` evidence with file, line, mutator name, and report artifact path.
+
+The default report path is:
+
+```text
+reports/mutation/mutation.json
+```
+
+StrykerJS must be configured by the project to write that JSON report, or the
+project can point CodeDecay at another local report path:
+
+```yaml
+toolAdapters:
+  stryker:
+    command: pnpm exec stryker run
+    reportPath: tmp/stryker-mutation.json
+```
 
 ## Schemathesis Harness
 

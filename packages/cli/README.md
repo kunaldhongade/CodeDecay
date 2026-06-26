@@ -33,6 +33,7 @@ npx codedecay llm-review --ping
 npx codedecay redteam --base main --head HEAD --format markdown
 npx codedecay agent --profile codex --base main --head HEAD --format markdown
 npx codedecay memory-import --input incidents.json
+npx codedecay memory-learn --input ci-failure.json
 ```
 
 ## Commands
@@ -47,6 +48,7 @@ npx codedecay memory-import --input incidents.json
 | `codedecay config` | Show normalized config. |
 | `codedecay memory` | Show local repo memory. |
 | `codedecay memory-import` | Preview or apply structured learnings into repo-local memory. |
+| `codedecay memory-learn` | Learn local memory from CI, PR, and CodeDecay report signals. |
 | `codedecay execute` | Run explicitly configured local checks and tool adapters. |
 | `codedecay differential` | Compare configured base/head behavior probes. |
 | `codedecay mcp` | Start the local MCP server. |

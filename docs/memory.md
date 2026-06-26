@@ -43,6 +43,30 @@ Imported learnings remain local-first and reviewable in git. After import, the
 next `codedecay analyze`, `redteam`, or `agent` run will use the merged memory
 to produce deterministic findings and recommended checks.
 
+## Learn From Raw Signals
+
+Use `codedecay memory-learn` when the input is closer to CI, PR, or CodeDecay
+report data than hand-authored memory.
+
+```bash
+npx codedecay memory-learn --input ci-failure.json
+npx codedecay memory-learn --input codedecay-report.json --apply --format json
+```
+
+Accepted inputs include:
+
+- `ciFailures`: failing workflow, job, message, command, files, and areas
+- `pullRequests`: title, body, commit messages, changed files, checks, and areas
+- `reports`, `codeDecayReports`, `failOnReports`, or `blockedReports`
+- a single CodeDecay JSON report with `tool: "CodeDecay"` and `findings`
+
+The learner converts those signals into flows, commands, architecture notes,
+and past regressions. It infers impacted areas from file paths and text such as
+`auth`, `api`, `schema`, `migration`, `workflow`, or `coverage`.
+
+`memory-learn` is deterministic and local. It does not query GitHub, inspect
+remote CI, call a model, or write anything unless `--apply` is passed.
+
 ## File Format
 
 ```json

@@ -72,6 +72,10 @@ export interface MemoryImportResult {
   merged: MemoryImportCounts;
 }
 
+export interface MemoryLearnResult extends MemoryImportResult {
+  learned: MemoryImportCounts;
+}
+
 export type MemoryProviderKind = "local" | "external";
 
 export interface MemoryProviderLoadOptions {
@@ -190,6 +194,20 @@ export function importCodeDecayMemory(
     },
     added,
     merged
+  };
+}
+
+export function learnCodeDecayMemory(
+  baseMemory: CodeDecayMemory,
+  learnedValue: unknown,
+  sourceName: string = "memory learn"
+): MemoryLearnResult {
+  const learnedMemory = normalizeLearnedMemory(learnedValue, sourceName);
+  const result = importCodeDecayMemory(baseMemory, learnedMemory, sourceName);
+
+  return {
+    ...result,
+    learned: countMemoryEntries(learnedMemory)
   };
 }
 
@@ -405,6 +423,338 @@ function normalizeImportedPullRequest(
           ]
         : []
   };
+}
+
+function normalizeLearnedMemory(value: unknown, sourcePath: string): CodeDecayMemory {
+  const object = normalizeObject(value, sourcePath, "root");
+  const learned = cloneMemory(DEFAULT_CODEDECAY_MEMORY);
+
+  for (const failure of normalizeArray(object.ciFailures, sourcePath, "ciFailures")) {
+    appendLearnedCiFailure(learned, failure, sourcePath);
+  }
+
+  for (const pullRequest of normalizeArray(object.pullRequests, sourcePath, "pullRequests")) {
+    appendLearnedPullRequest(learned, pullRequest, sourcePath);
+  }
+
+  for (const report of collectLearnedReports(object)) {
+    appendLearnedCodeDecayReport(learned, report);
+  }
+
+  if (isCodeDecayReportLike(object)) {
+    appendLearnedCodeDecayReport(learned, object);
+  }
+
+  return {
+    version: 1,
+    flows: sortFlows(learned.flows),
+    commands: sortCommands(learned.commands),
+    invariants: sortInvariants(learned.invariants),
+    architecture: sortArchitecture(learned.architecture),
+    regressions: sortRegressions(learned.regressions)
+  };
+}
+
+function appendLearnedCiFailure(memory: CodeDecayMemory, value: unknown, sourcePath: string): void {
+  const object = normalizeObject(value, sourcePath, "ciFailures[]");
+  const title =
+    optionalString(object.title, sourcePath, "ciFailures[].title") ??
+    optionalString(object.name, sourcePath, "ciFailures[].name") ??
+    optionalString(object.job, sourcePath, "ciFailures[].job") ??
+    optionalString(object.workflow, sourcePath, "ciFailures[].workflow") ??
+    "CI failure";
+  const description =
+    optionalString(object.description, sourcePath, "ciFailures[].description") ??
+    optionalString(object.summary, sourcePath, "ciFailures[].summary") ??
+    optionalString(object.message, sourcePath, "ciFailures[].message") ??
+    `Learned from CI failure: ${title}.`;
+  const command =
+    optionalString(object.command, sourcePath, "ciFailures[].command") ??
+    optionalString(object.testCommand, sourcePath, "ciFailures[].testCommand");
+  const matcher = inferMemoryMatcher(object, `${title}\n${description}`);
+  const check = optionalString(object.check, sourcePath, "ciFailures[].check") ?? command ?? `Re-run failing CI path: ${title}`;
+
+  memory.regressions.push({
+    title,
+    description,
+    check,
+    severity: "high",
+    ...matcher
+  });
+
+  if (command) {
+    memory.commands.push({
+      name: `${title} check`,
+      command,
+      description,
+      ...matcher
+    });
+  }
+}
+
+function appendLearnedPullRequest(memory: CodeDecayMemory, value: unknown, sourcePath: string): void {
+  const object = normalizeObject(value, sourcePath, "pullRequests[]");
+  const title = requiredString(object.title, sourcePath, "pullRequests[].title");
+  const body =
+    optionalString(object.body, sourcePath, "pullRequests[].body") ??
+    optionalString(object.description, sourcePath, "pullRequests[].description") ??
+    optionalString(object.summary, sourcePath, "pullRequests[].summary") ??
+    "";
+  const commits = optionalStringArray(object.commits, sourcePath, "pullRequests[].commits") ?? [];
+  const checks = optionalStringArray(object.checks, sourcePath, "pullRequests[].checks") ?? [];
+  const text = [title, body, ...commits].filter(Boolean).join("\n");
+  const matcher = inferMemoryMatcher(object, text);
+  const description = body || `Learned from merged PR: ${title}.`;
+  const generatedCheck = checks[0] ?? inferCheckFromText(title, text);
+
+  memory.architecture.push({
+    title,
+    note: description,
+    ...matcher
+  });
+
+  if (checks.length > 0) {
+    memory.flows.push({
+      name: title,
+      description,
+      checks,
+      ...matcher
+    });
+  }
+
+  if (looksLikeRegressionLearning(text)) {
+    memory.regressions.push({
+      title,
+      description,
+      check: generatedCheck,
+      severity: "medium",
+      ...matcher
+    });
+  }
+}
+
+function appendLearnedCodeDecayReport(memory: CodeDecayMemory, report: Record<string, unknown>): void {
+  const findings = Array.isArray(report.findings) ? report.findings : [];
+  const recommendedTests = Array.isArray(report.recommendedTests)
+    ? report.recommendedTests.filter((item): item is string => typeof item === "string")
+    : [];
+  const impactedAreas = Array.isArray(report.impactedAreas) ? report.impactedAreas : [];
+  const reportAreas = impactedAreas
+    .map((area) => (isPlainObject(area) && typeof area.kind === "string" ? normalizeAreaKind(area.kind) : undefined))
+    .filter((area): area is ImpactedArea["kind"] => Boolean(area));
+
+  for (const finding of findings) {
+    if (!isPlainObject(finding)) {
+      continue;
+    }
+
+    const severity = normalizeRiskValue(finding.severity);
+    if (severity === "low") {
+      continue;
+    }
+
+    const title = optionalString(finding.title, "CodeDecay report", "finding.title") ?? optionalString(finding.ruleId, "CodeDecay report", "finding.ruleId") ?? "CodeDecay finding";
+    const description =
+      optionalString(finding.description, "CodeDecay report", "finding.description") ??
+      `CodeDecay finding ${title} was learned from a blocked or reviewed report.`;
+    const file = optionalString(finding.file, "CodeDecay report", "finding.file");
+    const matcher = inferMemoryMatcher(
+      {
+        files: file ? [file] : undefined,
+        areas: reportAreas.length > 0 ? reportAreas : undefined
+      },
+      `${title}\n${description}\n${file ?? ""}`
+    );
+
+    memory.regressions.push({
+      title: `CodeDecay: ${title}`,
+      description,
+      check: recommendedTests[0] ?? `Re-check CodeDecay finding: ${title}`,
+      severity,
+      ...matcher
+    });
+  }
+}
+
+function collectLearnedReports(object: Record<string, unknown>): Record<string, unknown>[] {
+  return [
+    ...normalizeReportArray(object.reports),
+    ...normalizeReportArray(object.codeDecayReports),
+    ...normalizeReportArray(object.failOnReports),
+    ...normalizeReportArray(object.blockedReports)
+  ];
+}
+
+function normalizeReportArray(value: unknown): Record<string, unknown>[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  return value.filter((item): item is Record<string, unknown> => isPlainObject(item));
+}
+
+function isCodeDecayReportLike(value: Record<string, unknown>): boolean {
+  return value.tool === "CodeDecay" && Array.isArray(value.findings);
+}
+
+function inferMemoryMatcher(object: Record<string, unknown>, text: string): MemoryMatcher {
+  const files = collectMatcherFiles(object);
+  const areas = dedupeAreas([
+    ...collectMatcherAreas(object),
+    ...files.map(inferAreaFromFile).filter((area): area is ImpactedArea["kind"] => Boolean(area)),
+    ...inferAreasFromText(text)
+  ]);
+  const matcher: MemoryMatcher = {};
+
+  if (files.length > 0) {
+    matcher.files = files;
+  }
+
+  if (areas.length > 0) {
+    matcher.areas = areas;
+  }
+
+  return matcher;
+}
+
+function collectMatcherFiles(object: Record<string, unknown>): string[] {
+  const values: string[] = [];
+  if (typeof object.file === "string") {
+    values.push(object.file);
+  }
+
+  if (Array.isArray(object.files)) {
+    values.push(...object.files.filter((item): item is string => typeof item === "string"));
+  }
+
+  if (Array.isArray(object.changedFiles)) {
+    values.push(
+      ...object.changedFiles.flatMap((item) => {
+        if (typeof item === "string") {
+          return [item];
+        }
+
+        if (isPlainObject(item) && typeof item.path === "string") {
+          return [item.path];
+        }
+
+        return [];
+      })
+    );
+  }
+
+  return dedupeStrings(values.filter((item) => item.trim().length > 0));
+}
+
+function collectMatcherAreas(object: Record<string, unknown>): ImpactedArea["kind"][] {
+  if (!Array.isArray(object.areas)) {
+    return [];
+  }
+
+  return object.areas
+    .map((area) => (typeof area === "string" ? normalizeAreaKind(area) : undefined))
+    .filter((area): area is ImpactedArea["kind"] => Boolean(area));
+}
+
+function inferAreaFromFile(path: string): ImpactedArea["kind"] | undefined {
+  const normalized = path.toLowerCase();
+  if (/(^|\/)(auth|session|jwt|oauth|middleware|permissions?|rbac|acl)(\/|\.|-|_)/.test(normalized)) {
+    return "auth";
+  }
+
+  if (/(^|\/)(schema\.prisma|migrations?|drizzle|knex|sequelize|typeorm|db|database|models?)(\/|\.|-|_|$)/.test(normalized)) {
+    return "database";
+  }
+
+  if (/(^|\/)(pages\/api|app\/api|api|routes?|controllers?)(\/|\.|-|_)/.test(normalized)) {
+    return "api";
+  }
+
+  if (/(^|\/)(app|pages|routes|screens|views|components)(\/|\.|-|_)/.test(normalized)) {
+    return "ui";
+  }
+
+  if (/(^|\/)(docs?|readme|changelog|adr)(\/|\.|$)|\.(md|mdx|txt)$/.test(normalized)) {
+    return "docs";
+  }
+
+  if (/(^|\/)(test|tests|spec|specs|__tests__)(\/|\.|-|_)/.test(normalized)) {
+    return "test";
+  }
+
+  if (/(package\.json|pnpm-lock\.yaml|yarn\.lock|package-lock\.json|tsconfig|vite\.config|webpack\.config|\.github\/workflows)/.test(normalized)) {
+    return "config";
+  }
+
+  return "source";
+}
+
+function inferAreasFromText(text: string): ImpactedArea["kind"][] {
+  const normalized = text.toLowerCase();
+  const areas: ImpactedArea["kind"][] = [];
+
+  if (/\b(auth|session|jwt|oauth|token|permission|rbac|acl|login)\b/.test(normalized)) {
+    areas.push("auth");
+  }
+
+  if (/\b(api|route|controller|endpoint|request|response|http|graphql|rest)\b/.test(normalized)) {
+    areas.push("api");
+  }
+
+  if (/\b(db|database|schema|migration|prisma|sql|model)\b/.test(normalized)) {
+    areas.push("database");
+  }
+
+  if (/\b(ui|page|screen|view|component|render|frontend)\b/.test(normalized)) {
+    areas.push("ui");
+  }
+
+  if (/\b(config|build|deploy|workflow|ci|package|dependency|lockfile)\b/.test(normalized)) {
+    areas.push("config");
+  }
+
+  if (/\b(test|spec|coverage|assert|mutation)\b/.test(normalized)) {
+    areas.push("test");
+  }
+
+  return dedupeAreas(areas);
+}
+
+function normalizeAreaKind(value: string): ImpactedArea["kind"] | undefined {
+  return ["api", "ui", "database", "auth", "config", "test", "source", "docs"].includes(value)
+    ? (value as ImpactedArea["kind"])
+    : undefined;
+}
+
+function normalizeRiskValue(value: unknown): RiskLevel {
+  return value === "low" || value === "medium" || value === "high" ? value : "medium";
+}
+
+function dedupeAreas(values: ImpactedArea["kind"][]): ImpactedArea["kind"][] {
+  return [...new Set(values)].sort((left, right) => left.localeCompare(right));
+}
+
+function looksLikeRegressionLearning(text: string): boolean {
+  return /\b(fix|fixed|bug|regression|incident|failure|failed|broken|prevent|restore|wrong|missing|not refreshing|unauthorized|forbidden)\b/i.test(
+    text
+  );
+}
+
+function inferCheckFromText(title: string, text: string): string {
+  const trimmedTitle = title.trim();
+  if (/\b(auth|session|token|unauthorized|forbidden)\b/i.test(text)) {
+    return `Verify auth/session regression path for ${trimmedTitle}`;
+  }
+
+  if (/\b(api|route|endpoint|request|response)\b/i.test(text)) {
+    return `Verify API regression path for ${trimmedTitle}`;
+  }
+
+  if (/\b(db|database|schema|migration)\b/i.test(text)) {
+    return `Verify database regression path for ${trimmedTitle}`;
+  }
+
+  return `Verify regression path for ${trimmedTitle}`;
 }
 
 function loadLocalMemory(rootDir: string): LoadedCodeDecayMemory {
@@ -801,6 +1151,16 @@ function createEmptyMemoryImportCounts(): MemoryImportCounts {
     invariants: 0,
     architecture: 0,
     regressions: 0
+  };
+}
+
+function countMemoryEntries(memory: CodeDecayMemory): MemoryImportCounts {
+  return {
+    flows: memory.flows.length,
+    commands: memory.commands.length,
+    invariants: memory.invariants.length,
+    architecture: memory.architecture.length,
+    regressions: memory.regressions.length
   };
 }
 

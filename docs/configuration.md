@@ -43,6 +43,7 @@ toolAdapters:
   playwright: true
   stryker:
     command: pnpm exec stryker run
+    reportPath: reports/mutation/mutation.json
   schemathesis:
     schema: docs/openapi.yaml
     baseUrl: http://127.0.0.1:3000

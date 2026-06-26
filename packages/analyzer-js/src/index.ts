@@ -70,6 +70,28 @@ type HttpMethod = "GET" | "POST" | "PUT" | "PATCH" | "DELETE" | "HEAD" | "OPTION
 
 const SOURCE_EXTENSIONS = new Set([".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx"]);
 const SOURCE_EXTENSION_CANDIDATES = [".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx"];
+const ASSET_EXTENSIONS = new Set([
+  ".avif",
+  ".bmp",
+  ".eot",
+  ".gif",
+  ".ico",
+  ".jpeg",
+  ".jpg",
+  ".mp3",
+  ".mp4",
+  ".ogg",
+  ".otf",
+  ".pdf",
+  ".png",
+  ".svg",
+  ".ttf",
+  ".wav",
+  ".webm",
+  ".webp",
+  ".woff",
+  ".woff2"
+]);
 const TEST_DIR_NAMES = new Set(["test", "tests", "spec", "specs", "e2e", "integration", "__tests__", "__specs__"]);
 const TEST_FILE_STEM_PATTERN = /(^|[._-])(test|spec|e2e|integration)([._-]|$)/i;
 const IGNORED_DIRS = new Set([".git", "node_modules", "dist", "coverage", ".next", "build"]);
@@ -81,6 +103,19 @@ const MOCK_PATTERN =
 const TEST_CASE_PATTERN = /\b(it|test|specify)\s*\(/;
 const HTTP_METHODS: HttpMethod[] = ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"];
 const GENERIC_SOURCE_STEMS = new Set(["index", "main", "app", "page", "route", "layout", "config"]);
+const PACKAGE_METADATA_KEYS = new Set([
+  "author",
+  "bugs",
+  "description",
+  "funding",
+  "homepage",
+  "keywords",
+  "license",
+  "name",
+  "private",
+  "repository",
+  "version"
+]);
 
 export function analyzeJsProject(options: AnalyzeJsOptions): AnalyzerResult {
   const findings: Finding[] = [];
@@ -98,7 +133,7 @@ export function analyzeJsProject(options: AnalyzeJsOptions): AnalyzerResult {
   );
 
   for (const change of options.changedFiles) {
-    const classification = classifyPath(change.path);
+    const classification = classifyChange(change);
     if (classification) {
       impactedAreas.push({
         name: classification.name,
@@ -127,14 +162,14 @@ export function analyzeJsProject(options: AnalyzeJsOptions): AnalyzerResult {
 
   if (changedSourceFiles.length > 0 && changedTestFiles.length === 0) {
     const riskySourceFiles = changedSourceFiles
-      .filter((change) => classifyPath(change.path)?.risk !== "low")
+      .filter((change) => classifyChange(change)?.risk !== "low")
       .filter((change) => !fullyCoveredSourcePaths.has(change.path));
     if (riskySourceFiles.length > 0) {
       findings.push({
         ruleId: "missing-nearby-tests",
         title: "Risky source changes without changed tests",
         description: "This PR changes risky source areas but does not change any obvious test files.",
-        severity: riskySourceFiles.some((change) => classifyPath(change.path)?.risk === "high") ? "high" : "medium",
+        severity: riskySourceFiles.some((change) => classifyChange(change)?.risk === "high") ? "high" : "medium",
         category: "coverage",
         file: riskySourceFiles[0]?.path,
         line: firstLine(riskySourceFiles[0])
@@ -202,8 +237,24 @@ export function analyzeJsProject(options: AnalyzeJsOptions): AnalyzerResult {
   };
 }
 
+function classifyChange(change: FileChange): PathClassification | undefined {
+  if (isLockfilePath(change.path)) {
+    return { kind: "config", name: "Dependency lockfile", risk: "low" };
+  }
+
+  if (isPackageMetadataOnlyChange(change)) {
+    return { kind: "config", name: "Package metadata", risk: "low" };
+  }
+
+  return classifyPath(change.path);
+}
+
 function classifyPath(path: string): PathClassification | undefined {
   const normalized = path.toLowerCase();
+
+  if (isAssetPath(normalized)) {
+    return undefined;
+  }
 
   if (isDocsPath(normalized)) {
     return { kind: "docs", name: "Documentation", risk: "low" };
@@ -1142,7 +1193,7 @@ function isPlainObject(value: unknown): value is Record<string, any> {
 }
 
 function detectBroadUnrelatedChanges(changedFiles: FileChange[]): Finding | undefined {
-  const sourceFiles = changedFiles.filter((change) => !isDocsPath(change.path));
+  const sourceFiles = changedFiles.filter((change) => !isLowSignalChange(change));
   if (sourceFiles.length === 0) {
     return undefined;
   }
@@ -1858,8 +1909,61 @@ function isSourcePath(path: string): boolean {
   return SOURCE_EXTENSIONS.has(extname(path).toLowerCase());
 }
 
+function isAssetPath(path: string): boolean {
+  return ASSET_EXTENSIONS.has(extname(path).toLowerCase());
+}
+
 function isDocsPath(path: string): boolean {
   return /(^|\/)(docs?|readme|changelog|adr)(\/|\.|$)/i.test(path) || /\.(md|mdx|txt)$/i.test(path);
+}
+
+function isLowSignalChange(change: FileChange): boolean {
+  return (
+    isDocsPath(change.path) ||
+    isAssetPath(change.path) ||
+    isLockfilePath(change.path) ||
+    isPackageMetadataOnlyChange(change)
+  );
+}
+
+function isLockfilePath(path: string): boolean {
+  const normalized = normalizePath(path).toLowerCase();
+  const fileName = basename(normalized);
+  return (
+    fileName === "pnpm-lock.yaml" ||
+    fileName === "yarn.lock" ||
+    fileName === "package-lock.json" ||
+    fileName === "npm-shrinkwrap.json" ||
+    fileName === "bun.lock" ||
+    fileName === "bun.lockb"
+  );
+}
+
+function isPackageMetadataOnlyChange(change: FileChange): boolean {
+  if (basename(normalizePath(change.path)).toLowerCase() !== "package.json") {
+    return false;
+  }
+
+  const meaningfulLines = change.addedLines
+    .map((line) => line.content.trim())
+    .filter((line) => line.length > 0 && !line.startsWith("//"));
+
+  if (meaningfulLines.length === 0) {
+    return true;
+  }
+
+  return meaningfulLines.every((line) => {
+    if (/^[{}\[\],]+$/.test(line)) {
+      return true;
+    }
+
+    const keyMatch = /^"([^"]+)"\s*:/.exec(line);
+    if (keyMatch) {
+      return PACKAGE_METADATA_KEYS.has(keyMatch[1] ?? "");
+    }
+
+    return /^"[^"]+"\s*,?$/.test(line) || /^(true|false|null)\s*,?$/.test(line);
+  });
 }
 
 function isTestPath(path: string): boolean {

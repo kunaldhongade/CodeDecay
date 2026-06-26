@@ -150,6 +150,85 @@ describe("analyzeJsProject", () => {
     );
   });
 
+  it("keeps asset-only changes out of regression findings", () => {
+    const result = analyzeJsProject({
+      rootDir: fixtureRoot,
+      changedFiles: [
+        change("public/logo.svg", "<svg viewBox=\"0 0 24 24\"></svg>"),
+        change("public/fonts/display.woff2", "binary fixture")
+      ]
+    });
+
+    expect(result.impactedAreas).toEqual([]);
+    expect(result.findings).toEqual([]);
+  });
+
+  it("treats lockfile-only changes as low-signal config changes", () => {
+    const result = analyzeJsProject({
+      rootDir: fixtureRoot,
+      changedFiles: [change("pnpm-lock.yaml", "  '@submuxhq/codedecay@0.2.0':")]
+    });
+
+    expect(result.impactedAreas).toEqual([
+      expect.objectContaining({ kind: "config", risk: "low", files: ["pnpm-lock.yaml"] })
+    ]);
+    expect(result.findings).toEqual([
+      expect.objectContaining({ ruleId: "risky-config-change", severity: "low", file: "pnpm-lock.yaml" })
+    ]);
+  });
+
+  it("treats package metadata-only changes as low-signal config changes", () => {
+    const result = analyzeJsProject({
+      rootDir: fixtureRoot,
+      changedFiles: [
+        {
+          path: "package.json",
+          status: "modified",
+          additions: 4,
+          deletions: 0,
+          addedLines: [
+            { line: 2, content: '  "description": "Regression-risk analysis for pull requests",' },
+            { line: 3, content: '  "keywords": [' },
+            { line: 4, content: '    "static-analysis"' },
+            { line: 5, content: "  ]" }
+          ]
+        }
+      ]
+    });
+
+    expect(result.impactedAreas).toEqual([
+      expect.objectContaining({ kind: "config", risk: "low", files: ["package.json"] })
+    ]);
+    expect(result.findings).toEqual([
+      expect.objectContaining({ ruleId: "risky-config-change", severity: "low", file: "package.json" })
+    ]);
+  });
+
+  it("keeps package dependency changes visible as medium config risk", () => {
+    const result = analyzeJsProject({
+      rootDir: fixtureRoot,
+      changedFiles: [
+        {
+          path: "package.json",
+          status: "modified",
+          additions: 2,
+          deletions: 0,
+          addedLines: [
+            { line: 10, content: '  "dependencies": {' },
+            { line: 11, content: '    "express": "^5.0.0"' }
+          ]
+        }
+      ]
+    });
+
+    expect(result.impactedAreas).toEqual([
+      expect.objectContaining({ kind: "config", risk: "medium", files: ["package.json"] })
+    ]);
+    expect(result.findings).toEqual([
+      expect.objectContaining({ ruleId: "risky-config-change", severity: "medium", file: "package.json" })
+    ]);
+  });
+
   it("extracts Next.js route and API impacts from changed files", () => {
     const rootDir = createTempProject({
       "src/app/api/users/route.ts": "export async function GET() { return Response.json([]); }\nexport async function POST() { return Response.json({ ok: true }); }\n",

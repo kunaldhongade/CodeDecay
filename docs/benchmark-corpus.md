@@ -8,6 +8,9 @@ scoring changes are forced through representative cases instead of anecdotes.
 The current benchmark set includes:
 
 - low-signal docs or copy style changes that must stay below headline high risk
+- asset-only changes such as SVGs, images, fonts, and other static files
+- lockfile-only changes that should not be treated like source behavior changes
+- package metadata-only changes such as description and keyword updates
 - medium-risk behavior changes that should stay visible without being inflated
 - clearly risky auth or API changes that should remain high signal
 

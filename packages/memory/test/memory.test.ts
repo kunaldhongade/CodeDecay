@@ -9,6 +9,7 @@ import {
   createLocalMemoryProvider,
   createMemoryProviderRegistry,
   importCodeDecayMemory,
+  learnCodeDecayMemory,
   loadCodeDecayMemory,
   loadCodeDecayMemoryFromProvider,
   writeCodeDecayMemory,
@@ -239,6 +240,75 @@ describe("CodeDecay memory", () => {
 
     expect(sourcePath).toBe(join(root, ".codedecay/memory.json"));
     expect(loaded.memory.flows[0]?.name).toBe("Checkout");
+  });
+
+  it("learns local memory from CI failures, PR text, and CodeDecay reports", () => {
+    const result = learnCodeDecayMemory(
+      {
+        version: 1,
+        flows: [],
+        commands: [],
+        invariants: [],
+        architecture: [],
+        regressions: []
+      },
+      {
+        ciFailures: [
+          {
+            title: "Auth smoke failed",
+            message: "Token refresh returned 401 after deploy.",
+            command: "pnpm test auth",
+            files: ["src/auth/session.ts"]
+          }
+        ],
+        pullRequests: [
+          {
+            title: "fix: auth token not refreshing on 401",
+            body: "Restores session refresh for expired access tokens.",
+            commits: ["fix auth retry path"],
+            changedFiles: ["src/app/api/session/route.ts"],
+            checks: ["expired token refresh"]
+          }
+        ],
+        reports: [
+          {
+            tool: "CodeDecay",
+            findings: [
+              {
+                ruleId: "missing-nearby-tests",
+                title: "Risky source changes without changed tests",
+                description: "Auth source changed without a test update.",
+                severity: "high",
+                file: "src/auth/session.ts"
+              }
+            ],
+            impactedAreas: [{ kind: "auth" }],
+            recommendedTests: ["Add missing-token auth regression test"]
+          }
+        ]
+      },
+      "learn.json"
+    );
+
+    expect(result.learned).toMatchObject({
+      flows: 1,
+      commands: 1,
+      architecture: 1,
+      regressions: 3
+    });
+    expect(result.memory.commands).toEqual(
+      expect.arrayContaining([expect.objectContaining({ name: "Auth smoke failed check", command: "pnpm test auth" })])
+    );
+    expect(result.memory.flows).toEqual(
+      expect.arrayContaining([expect.objectContaining({ name: "fix: auth token not refreshing on 401" })])
+    );
+    expect(result.memory.regressions).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ title: "Auth smoke failed", severity: "high", areas: expect.arrayContaining(["auth"]) }),
+        expect.objectContaining({ title: "fix: auth token not refreshing on 401", severity: "medium" }),
+        expect.objectContaining({ title: "CodeDecay: Risky source changes without changed tests", severity: "high" })
+      ])
+    );
   });
 });
 

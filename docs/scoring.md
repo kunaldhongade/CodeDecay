@@ -17,6 +17,11 @@ Signals include:
 - risky source changes without nearby test changes
 - heavy mocking that may weaken regression confidence
 
+Low-signal changes are dampened before scoring. Asset-only changes, docs-only
+changes, lockfile-only changes, and package metadata-only changes stay low
+unless they are paired with source, dependency, runtime config, or structural
+changes.
+
 ## Decay Score
 
 Decay score estimates whether the PR makes the codebase harder to maintain.
