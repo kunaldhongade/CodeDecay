@@ -18,6 +18,11 @@ interface HealthServer {
   close: () => Promise<void>;
 }
 
+interface DemoAppServer {
+  origin: string;
+  close: () => Promise<void>;
+}
+
 const tempRoots: string[] = [];
 
 afterEach(() => {
@@ -1592,6 +1597,204 @@ describe("codedecay product CLI contract", () => {
     expect(readFileSync(join(repo, "teardown.txt"), "utf8")).toBe("yes");
   });
 
+  it("refuses product exploration without configured targets", async () => {
+    const cwd = createTempDir();
+
+    const result = await run(["product", "--explore", "--format", "json"], cwd);
+
+    expect(result.exitCode).toBe(2);
+    expect(result.stdout).toBe("");
+    expect(result.stderr).toContain("codedecay product --explore requires at least one configured productTesting target.");
+  });
+
+  it("blocks product exploration until explicit command safety is enabled", async () => {
+    const server = await startDemoAppServer();
+    const repo = createLowRiskRepo();
+    installFakePlaywright(repo);
+    writeProductTargetConfig(repo, {
+      baseUrl: server.origin,
+      allowCommands: false
+    });
+
+    try {
+      const result = await run(["product", "--explore", "--format", "json"], repo);
+      const report = JSON.parse(result.stdout);
+
+      expect(result.exitCode).toBe(1);
+      expect(report.summary.status).toBe("blocked");
+      expect(report.targets[0]).toMatchObject({
+        status: "blocked",
+        exploration: {
+          status: "blocked",
+          driver: "playwright",
+          error: "Product exploration requires safety.allowCommands to be true."
+        }
+      });
+      expect(existsSync(join(repo, ".codedecay/local/product-flow-maps/web/flow-map.json"))).toBe(false);
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("reports missing project Playwright without installing packages or browsers", async () => {
+    const server = await startDemoAppServer();
+    const repo = createLowRiskRepo();
+    writeProductTargetConfig(repo, {
+      baseUrl: server.origin,
+      allowCommands: true
+    });
+
+    try {
+      const result = await run(["product", "--explore", "--format", "json"], repo);
+      const report = JSON.parse(result.stdout);
+
+      expect(result.exitCode).toBe(1);
+      expect(report.targets[0]).toMatchObject({
+        status: "blocked",
+        exploration: {
+          status: "blocked",
+          driver: "playwright"
+        }
+      });
+      expect(report.targets[0].exploration.error).toContain("Playwright is not installed or cannot be loaded");
+      expect(existsSync(join(repo, ".codedecay/local/product-flow-maps/web/flow-map.json"))).toBe(false);
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("uses project Playwright to crawl same-origin flows and write a flow-map artifact", async () => {
+    const server = await startDemoAppServer();
+    const repo = createLowRiskRepo();
+    installFakePlaywright(repo);
+    writeProductTargetConfig(repo, {
+      baseUrl: server.origin,
+      allowCommands: true
+    });
+
+    try {
+      const result = await run(["product", "--explore", "--max-pages", "5", "--format", "json"], repo);
+      const report = JSON.parse(result.stdout);
+      const artifactPath = join(repo, ".codedecay/local/product-flow-maps/web/flow-map.json");
+      const flowMap = JSON.parse(readFileSync(artifactPath, "utf8"));
+
+      expect(result.exitCode).toBe(0);
+      expect(report.summary.status).toBe("passed");
+      expect(report.targets[0].exploration).toMatchObject({
+        status: "passed",
+        driver: "playwright",
+        artifactPath: ".codedecay/local/product-flow-maps/web/flow-map.json",
+        pages: 2
+      });
+      expect(report.safety.browserAutomationRan).toBe(true);
+      expect(flowMap).toMatchObject({
+        schemaVersion: 1,
+        target: {
+          id: "web",
+          baseUrl: server.origin,
+          origin: server.origin
+        },
+        limits: {
+          sameOrigin: true,
+          maxPages: 5,
+          allowDestructiveActions: false
+        },
+        summary: {
+          pages: 2,
+          blockedActions: expect.any(Number)
+        }
+      });
+      expect(flowMap.pages.map((page: { path: string }) => page.path)).toEqual(["/", "/settings"]);
+      expect(flowMap.pages[0].links).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            href: `${server.origin}/settings`,
+            sameOrigin: true,
+            discovered: true
+          }),
+          expect.objectContaining({
+            href: "https://example.com",
+            sameOrigin: false,
+            discovered: false
+          })
+        ])
+      );
+      expect(flowMap.blockedActions).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            name: "Delete user"
+          })
+        ])
+      );
+
+      const markdown = await run(["product", "--explore", "--max-pages", "1", "--format", "markdown"], repo);
+      expect(markdown.exitCode).toBe(0);
+      expect(markdown.stdout).toContain("Flow map: `.codedecay/local/product-flow-maps/web/flow-map.json`");
+      expect(markdown.stdout).toContain("Browser automation ran: yes");
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("honors product explorer max-page limits and destructive-action opt-in", async () => {
+    const server = await startDemoAppServer();
+    const repo = createLowRiskRepo();
+    installFakePlaywright(repo);
+    writeProductTargetConfig(repo, {
+      baseUrl: server.origin,
+      allowCommands: true
+    });
+
+    try {
+      const result = await run(
+        ["product", "--explore", "--max-pages", "1", "--allow-destructive-actions", "--format", "json"],
+        repo
+      );
+      const report = JSON.parse(result.stdout);
+      const flowMap = JSON.parse(readFileSync(join(repo, ".codedecay/local/product-flow-maps/web/flow-map.json"), "utf8"));
+
+      expect(result.exitCode).toBe(0);
+      expect(report.targets[0].exploration).toMatchObject({
+        pages: 1,
+        blockedActions: 0
+      });
+      expect(flowMap.pages).toHaveLength(1);
+      expect(flowMap.pages.map((page: { path: string }) => page.path)).toEqual(["/"]);
+      expect(flowMap.summary.blockedActions).toBe(0);
+      expect(flowMap.pages[0].interactiveElements.some((element: { destructive: boolean; blocked: boolean }) => element.destructive && !element.blocked)).toBe(true);
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("honors product explorer max-action limits", async () => {
+    const server = await startDemoAppServer();
+    const repo = createLowRiskRepo();
+    installFakePlaywright(repo);
+    writeProductTargetConfig(repo, {
+      baseUrl: server.origin,
+      allowCommands: true
+    });
+
+    try {
+      const result = await run(["product", "--explore", "--max-pages", "1", "--max-actions", "1", "--format", "json"], repo);
+      const report = JSON.parse(result.stdout);
+      const flowMap = JSON.parse(readFileSync(join(repo, ".codedecay/local/product-flow-maps/web/flow-map.json"), "utf8"));
+
+      expect(result.exitCode).toBe(0);
+      expect(report.targets[0].exploration).toMatchObject({
+        interactiveElements: 1
+      });
+      expect(report.targets[0].exploration.skippedActions).toBeGreaterThan(0);
+      expect(flowMap.summary).toMatchObject({
+        interactiveElements: 1
+      });
+      expect(flowMap.summary.skippedActions).toBeGreaterThan(0);
+    } finally {
+      await server.close();
+    }
+  });
+
   it("fails clearly when a requested product target is unknown", async () => {
     const repo = createLowRiskRepo();
     writeFile(
@@ -1737,6 +1940,121 @@ async function startHealthServer(): Promise<HealthServer> {
       await closeServer(server);
     }
   };
+}
+
+async function startDemoAppServer(): Promise<DemoAppServer> {
+  const server = createServer((request, response) => {
+    const url = request.url ?? "/";
+    response.setHeader("content-type", "text/html; charset=utf-8");
+
+    if (url === "/" || url === "") {
+      response.end(
+        [
+          "<!doctype html>",
+          "<html>",
+          "<head><title>Demo Home</title></head>",
+          "<body>",
+          '<a href="/settings">Settings</a>',
+          '<a href="https://example.com">External</a>',
+          '<form method="post" action="/users/delete" aria-label="Delete user">',
+          '<button type="submit">Delete user</button>',
+          "</form>",
+          "</body>",
+          "</html>"
+        ].join("")
+      );
+      return;
+    }
+
+    if (url === "/settings") {
+      response.end(
+        [
+          "<!doctype html>",
+          "<html>",
+          "<head><title>Settings</title></head>",
+          "<body>",
+          '<a href="/">Home</a>',
+          '<label>Email <input name="email" placeholder="Email address"></label>',
+          '<button type="button">Preview settings</button>',
+          "</body>",
+          "</html>"
+        ].join("")
+      );
+      return;
+    }
+
+    response.writeHead(404);
+    response.end("<title>Not found</title>");
+  });
+
+  await listenOnLoopback(server);
+  const address = server.address();
+  if (!address || typeof address === "string") {
+    throw new Error("Failed to bind demo app server.");
+  }
+
+  return {
+    origin: `http://127.0.0.1:${address.port}`,
+    close: async () => {
+      await closeServer(server);
+    }
+  };
+}
+
+function installFakePlaywright(repo: string): void {
+  writeFile(
+    repo,
+    "node_modules/playwright/index.js",
+    [
+      "const { writeFileSync } = require('node:fs');",
+      "function titleFrom(html) {",
+      "  const match = /<title[^>]*>([\\s\\S]*?)<\\/title>/i.exec(html);",
+      "  return match ? match[1].replace(/\\s+/g, ' ').trim() : '';",
+      "}",
+      "exports.chromium = {",
+      "  async launch() {",
+      "    return {",
+      "      async newPage() {",
+      "        let currentUrl = '';",
+      "        let currentHtml = '';",
+      "        return {",
+      "          async goto(url) {",
+      "            const response = await fetch(url);",
+      "            currentUrl = response.url.replace(/\\/$/, '');",
+      "            currentHtml = await response.text();",
+      "          },",
+      "          async content() { return currentHtml; },",
+      "          async title() { return titleFrom(currentHtml); },",
+      "          url() { return currentUrl; },",
+      "          async screenshot(options) { writeFileSync(options.path, 'fake screenshot'); },",
+      "          async close() {}",
+      "        };",
+      "      },",
+      "      async close() {}",
+      "    };",
+      "  }",
+      "};",
+      ""
+    ].join("\n")
+  );
+}
+
+function writeProductTargetConfig(repo: string, input: { baseUrl: string; allowCommands: boolean }): void {
+  writeFile(
+    repo,
+    ".codedecay/config.yml",
+    [
+      "version: 1",
+      "productTesting:",
+      "  targets:",
+      "    web:",
+      `      baseUrl: ${input.baseUrl}`,
+      "      timeoutMs: 2000",
+      "safety:",
+      `  allowCommands: ${input.allowCommands}`,
+      ""
+    ].join("\n")
+  );
 }
 
 async function getFreePort(): Promise<number> {

@@ -1,5 +1,6 @@
 import { spawn, spawnSync, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { createRequire } from "node:module";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
@@ -122,6 +123,10 @@ interface ProductOptions {
   format: ConfigFormat;
   output?: string | undefined;
   target?: string | undefined;
+  explore: boolean;
+  maxPages: number;
+  maxActions: number;
+  allowDestructiveActions: boolean;
 }
 
 interface DifferentialOptions {
@@ -222,6 +227,7 @@ interface ProductTargetResult {
   setup?: CommandExecutionResult | undefined;
   start?: ProductStartResult | undefined;
   health?: ProductHealthResult | undefined;
+  exploration?: ProductExplorationResult | undefined;
   teardown?: CommandExecutionResult | undefined;
   notes: string[];
 }
@@ -250,8 +256,90 @@ interface ProductHealthResult {
   error?: string | undefined;
 }
 
+interface ProductExplorationResult {
+  status: ProductTargetStatus;
+  driver: "playwright";
+  artifactPath?: string | undefined;
+  pages: number;
+  interactiveElements: number;
+  blockedActions: number;
+  skippedActions: number;
+  durationMs: number;
+  error?: string | undefined;
+  notes: string[];
+}
+
+interface ProductExplorerOptions {
+  maxPages: number;
+  maxActions: number;
+  allowDestructiveActions: boolean;
+}
+
+interface ProductFlowMap {
+  schemaVersion: 1;
+  generatedAt: string;
+  target: {
+    id: string;
+    baseUrl: string;
+    origin: string;
+  };
+  driver: "playwright";
+  limits: {
+    sameOrigin: true;
+    maxPages: number;
+    maxActions: number;
+    allowDestructiveActions: boolean;
+  };
+  summary: {
+    pages: number;
+    interactiveElements: number;
+    blockedActions: number;
+    skippedActions: number;
+  };
+  pages: ProductFlowPage[];
+  blockedActions: ProductBlockedAction[];
+}
+
+interface ProductFlowPage {
+  url: string;
+  title: string;
+  path: string;
+  depth: number;
+  links: ProductFlowLink[];
+  interactiveElements: ProductInteractiveElement[];
+  screenshotPath?: string | undefined;
+}
+
+interface ProductFlowLink {
+  href: string;
+  text: string;
+  selector: string;
+  sameOrigin: boolean;
+  discovered: boolean;
+}
+
+interface ProductInteractiveElement {
+  kind: "link" | "form" | "button" | "input";
+  selector: string;
+  name: string;
+  action?: string | undefined;
+  method?: string | undefined;
+  inputType?: string | undefined;
+  destructive: boolean;
+  blocked: boolean;
+  blockReason?: string | undefined;
+}
+
+interface ProductBlockedAction {
+  pageUrl: string;
+  selector: string;
+  name: string;
+  reason: string;
+}
+
 interface ProductTargetSafetySummary {
   commandsExecuted: boolean;
+  browserAutomationRan: boolean;
   startupCommandsAllowed: boolean;
   telemetrySent: false;
   cloudDependency: false;
@@ -687,16 +775,22 @@ const HELP_DOCS: Record<string, CommandDoc> = {
     options: [
       { flag: "--cwd <path>", description: "Repository working directory (default: current directory)" },
       { flag: "--target <id>", description: "Run only one configured product target" },
+      { flag: "--explore", description: "Use a project-provided Playwright install to crawl same-origin product flows" },
+      { flag: "--max-pages <count>", description: "Maximum pages to visit during --explore (default: 10)" },
+      { flag: "--max-actions <count>", description: "Maximum interactive elements to record during --explore (default: 50)" },
+      { flag: "--allow-destructive-actions", description: "Record destructive forms/actions as allowed instead of blocked" },
       { flag: "--format <format>", description: "json or markdown (default: markdown)" },
       { flag: "--output <path>", description: "Write product target report to a file instead of stdout" }
     ],
     examples: [
       "codedecay product --format markdown",
-      "codedecay product --target web --format json"
+      "codedecay product --target web --format json",
+      "codedecay product --target web --explore --max-pages 5 --format markdown"
     ],
     notes: [
       "Product target commands run only when they are configured and `safety.allowCommands` is true.",
-      "Existing `baseUrl` and preview URL targets are checked without starting commands."
+      "Existing `baseUrl` and preview URL targets are checked without starting commands.",
+      "`--explore` is an explicit execution workflow and requires `safety.allowCommands: true` plus a project-provided Playwright install."
     ]
   },
   mcp: {
@@ -1916,7 +2010,11 @@ function parseExecuteArgs(args: string[]): ExecuteOptions {
 
 function parseProductArgs(args: string[]): ProductOptions {
   const options: ProductOptions = {
-    format: "markdown"
+    format: "markdown",
+    explore: false,
+    maxPages: 10,
+    maxActions: 50,
+    allowDestructiveActions: false
   };
 
   for (let index = 0; index < args.length; index += 1) {
@@ -1949,6 +2047,38 @@ function parseProductArgs(args: string[]): ProductOptions {
     if (arg === "--target") {
       options.target = requireValue(args, index, arg);
       index += 1;
+      continue;
+    }
+
+    if (arg === "--explore") {
+      options.explore = true;
+      continue;
+    }
+
+    if (arg.startsWith("--max-pages=")) {
+      options.maxPages = parsePositiveInteger(arg.slice("--max-pages=".length), "--max-pages");
+      continue;
+    }
+
+    if (arg === "--max-pages") {
+      options.maxPages = parsePositiveInteger(requireValue(args, index, arg), arg);
+      index += 1;
+      continue;
+    }
+
+    if (arg.startsWith("--max-actions=")) {
+      options.maxActions = parsePositiveInteger(arg.slice("--max-actions=".length), "--max-actions");
+      continue;
+    }
+
+    if (arg === "--max-actions") {
+      options.maxActions = parsePositiveInteger(requireValue(args, index, arg), arg);
+      index += 1;
+      continue;
+    }
+
+    if (arg === "--allow-destructive-actions") {
+      options.allowDestructiveActions = true;
       continue;
     }
 
@@ -2563,6 +2693,15 @@ function parsePackageManager(value: string): PackageManager {
   }
 
   throw new Error(`Invalid package manager "${value}". Expected npm, pnpm, yarn, or bun.`);
+}
+
+function parsePositiveInteger(value: string, flag: string): number {
+  const parsed = Number(value);
+  if (Number.isInteger(parsed) && parsed > 0) {
+    return parsed;
+  }
+
+  throw new Error(`Invalid value for ${flag}: expected a positive integer.`);
 }
 
 function requireValue(args: string[], index: number, flag: string): string {
@@ -3191,10 +3330,14 @@ async function createProductTargetReport(
   const startedAt = Date.now();
   const allTargets = Object.values(loadedConfig.config.productTesting.targets).sort((left, right) => left.id.localeCompare(right.id));
   const targets = selectProductTargets(allTargets, options.target);
+  if (options.explore && targets.length === 0) {
+    throw new Error("codedecay product --explore requires at least one configured productTesting target.");
+  }
+
   const results: ProductTargetResult[] = [];
 
   for (const target of targets) {
-    results.push(await runProductTarget(rootDir, loadedConfig, target));
+    results.push(await runProductTarget(rootDir, loadedConfig, target, options));
   }
 
   const report: ProductTargetReport = {
@@ -3205,13 +3348,15 @@ async function createProductTargetReport(
     targets: results,
     safety: {
       commandsExecuted: results.some((result) => commandActuallyExecuted(result.setup) || commandActuallyExecuted(result.teardown) || result.start?.status === "started"),
+      browserAutomationRan: results.some((result) => result.exploration?.status === "passed" || result.exploration?.status === "failed"),
       startupCommandsAllowed: loadedConfig.config.safety.allowCommands,
       telemetrySent: false,
       cloudDependency: false,
       notes: [
         "Product target checks are explicit and local-first.",
         "CodeDecay only runs configured product target commands when safety.allowCommands is true.",
-        "Existing baseUrl and preview URL targets can be health-checked without startup commands."
+        "Existing baseUrl and preview URL targets can be health-checked without startup commands.",
+        "Product exploration uses a project-provided Playwright install and never installs browsers."
       ]
     }
   };
@@ -3240,13 +3385,15 @@ function selectProductTargets(targets: CodeDecayProductTarget[], requestedTarget
 async function runProductTarget(
   rootDir: string,
   loadedConfig: LoadedCodeDecayConfig,
-  target: CodeDecayProductTarget
+  target: CodeDecayProductTarget,
+  options: ProductOptions
 ): Promise<ProductTargetResult> {
   const startedAt = Date.now();
   const notes = [...target.readiness.notes];
   let setup: CommandExecutionResult | undefined;
   let startResult: ManagedProductProcess | undefined;
   let health: ProductHealthResult | undefined;
+  let exploration: ProductExplorationResult | undefined;
   let teardown: CommandExecutionResult | undefined;
   let status: ProductTargetStatus = "skipped";
   let shouldRunHealthCheck = true;
@@ -3281,6 +3428,32 @@ async function runProductTarget(
         status = health.status;
       }
     }
+
+    if (options.explore) {
+      if (health?.status === "passed") {
+        exploration = await exploreProductTarget(rootDir, loadedConfig, target, health, {
+          maxPages: options.maxPages,
+          maxActions: options.maxActions,
+          allowDestructiveActions: options.allowDestructiveActions
+        });
+        if (exploration.status !== "passed") {
+          status = exploration.status;
+        }
+      } else if (!isProductTargetFailure(status)) {
+        status = "blocked";
+        exploration = {
+          status: "blocked",
+          driver: "playwright",
+          pages: 0,
+          interactiveElements: 0,
+          blockedActions: 0,
+          skippedActions: 0,
+          durationMs: 0,
+          error: "Product exploration requires a healthy target URL.",
+          notes: ["Run a target with baseUrl, resolved previewUrlEnv, or healthCheck before exploration."]
+        };
+      }
+    }
   } finally {
     if (startResult?.child) {
       await stopManagedProductProcess(startResult.child);
@@ -3295,7 +3468,7 @@ async function runProductTarget(
     }
   }
 
-  return createProductTargetResult(target, status, startedAt, notes, setup, startResult, health, teardown);
+  return createProductTargetResult(target, status, startedAt, notes, setup, startResult, health, exploration, teardown);
 }
 
 function createProductTargetResult(
@@ -3306,6 +3479,7 @@ function createProductTargetResult(
   setup: CommandExecutionResult | undefined,
   start: ManagedProductProcess | undefined,
   health: ProductHealthResult | undefined,
+  exploration: ProductExplorationResult | undefined,
   teardown: CommandExecutionResult | undefined
 ): ProductTargetResult {
   const result: ProductTargetResult = {
@@ -3330,6 +3504,10 @@ function createProductTargetResult(
 
   if (health) {
     result.health = health;
+  }
+
+  if (exploration) {
+    result.exploration = exploration;
   }
 
   if (teardown) {
@@ -3518,6 +3696,592 @@ async function pollProductHealth(url: string, timeoutMs: number): Promise<Produc
   };
 }
 
+async function exploreProductTarget(
+  rootDir: string,
+  loadedConfig: LoadedCodeDecayConfig,
+  target: CodeDecayProductTarget,
+  health: ProductHealthResult,
+  options: ProductExplorerOptions
+): Promise<ProductExplorationResult> {
+  const startedAt = Date.now();
+  const baseUrl = resolveProductExploreBaseUrl(target, health);
+  const notes = [
+    "Explorer uses same-origin crawling by default.",
+    "Destructive forms and actions are recorded as blocked unless --allow-destructive-actions is set."
+  ];
+
+  if (!loadedConfig.config.safety.allowCommands) {
+    return {
+      status: "blocked",
+      driver: "playwright",
+      pages: 0,
+      interactiveElements: 0,
+      blockedActions: 0,
+      skippedActions: 0,
+      durationMs: elapsed(startedAt),
+      error: "Product exploration requires safety.allowCommands to be true.",
+      notes
+    };
+  }
+
+  if (!baseUrl) {
+    return {
+      status: "blocked",
+      driver: "playwright",
+      pages: 0,
+      interactiveElements: 0,
+      blockedActions: 0,
+      skippedActions: 0,
+      durationMs: elapsed(startedAt),
+      error: "Product exploration requires a baseUrl, resolved previewUrlEnv, or healthCheck URL.",
+      notes
+    };
+  }
+
+  const playwright = loadProjectPlaywright(rootDir);
+  if (!playwright.ok) {
+    return {
+      status: "blocked",
+      driver: "playwright",
+      pages: 0,
+      interactiveElements: 0,
+      blockedActions: 0,
+      skippedActions: 0,
+      durationMs: elapsed(startedAt),
+      error: playwright.error,
+      notes: [...notes, "Install Playwright in the target project; CodeDecay does not install browsers or packages."]
+    };
+  }
+
+  let browser: ProductPlaywrightBrowser | undefined;
+  try {
+    browser = await playwright.module.chromium.launch({ headless: true });
+    const artifactRoot = join(".codedecay", "local", "product-flow-maps", sanitizeArtifactSegment(target.id));
+    const flowMap = await crawlProductFlowMap({
+      browser,
+      rootDir,
+      artifactRoot,
+      target,
+      baseUrl,
+      options,
+      timeoutMs: target.timeoutMs
+    });
+    const artifactPath = join(artifactRoot, "flow-map.json");
+    writeOutput(rootDir, artifactPath, `${JSON.stringify(flowMap, null, 2)}\n`);
+
+    return {
+      status: "passed",
+      driver: "playwright",
+      artifactPath,
+      pages: flowMap.summary.pages,
+      interactiveElements: flowMap.summary.interactiveElements,
+      blockedActions: flowMap.summary.blockedActions,
+      skippedActions: flowMap.summary.skippedActions,
+      durationMs: elapsed(startedAt),
+      notes
+    };
+  } catch (error: unknown) {
+    const message = error instanceof Error ? error.message : String(error);
+    return {
+      status: "failed",
+      driver: "playwright",
+      pages: 0,
+      interactiveElements: 0,
+      blockedActions: 0,
+      skippedActions: 0,
+      durationMs: elapsed(startedAt),
+      error: `Playwright product exploration failed: ${message}`,
+      notes: [...notes, "CodeDecay does not install Playwright browsers; run the project's normal Playwright setup if browser launch fails."]
+    };
+  } finally {
+    await browser?.close?.();
+  }
+}
+
+interface ProductPlaywrightModule {
+  chromium: {
+    launch: (options: { headless: boolean }) => Promise<ProductPlaywrightBrowser>;
+  };
+}
+
+interface ProductPlaywrightBrowser {
+  newPage: () => Promise<ProductPlaywrightPage>;
+  close?: () => Promise<void>;
+}
+
+interface ProductPlaywrightPage {
+  goto: (url: string, options: { waitUntil: "domcontentloaded"; timeout: number }) => Promise<unknown>;
+  content: () => Promise<string>;
+  title?: () => Promise<string>;
+  url?: () => string;
+  screenshot?: (options: { path: string; fullPage: boolean }) => Promise<unknown>;
+  close?: () => Promise<void>;
+}
+
+function loadProjectPlaywright(rootDir: string): { ok: true; module: ProductPlaywrightModule } | { ok: false; error: string } {
+  try {
+    const projectRequire = createRequire(join(rootDir, "package.json"));
+    const loaded = projectRequire("playwright") as Partial<ProductPlaywrightModule>;
+    if (!loaded.chromium?.launch) {
+      return {
+        ok: false,
+        error: "Project Playwright package does not expose chromium.launch."
+      };
+    }
+
+    return {
+      ok: true,
+      module: loaded as ProductPlaywrightModule
+    };
+  } catch (error: unknown) {
+    const message = error instanceof Error ? error.message : String(error);
+    return {
+      ok: false,
+      error: `Playwright is not installed or cannot be loaded from the target project: ${message}`
+    };
+  }
+}
+
+async function crawlProductFlowMap(input: {
+  browser: ProductPlaywrightBrowser;
+  rootDir: string;
+  artifactRoot: string;
+  target: CodeDecayProductTarget;
+  baseUrl: string;
+  options: ProductExplorerOptions;
+  timeoutMs: number;
+}): Promise<ProductFlowMap> {
+  const startUrl = normalizeExploreUrl(input.baseUrl);
+  const origin = new URL(startUrl).origin;
+  const queue: Array<{ url: string; depth: number }> = [{ url: startUrl, depth: 0 }];
+  const queued = new Set([startUrl]);
+  const visited = new Set<string>();
+  const pages: ProductFlowPage[] = [];
+  const crawlState = {
+    recordedActions: 0,
+    skippedActions: 0,
+    blockedActions: [] as ProductBlockedAction[]
+  };
+  const page = await input.browser.newPage();
+
+  try {
+    while (queue.length > 0 && pages.length < input.options.maxPages) {
+      const next = queue.shift();
+      if (!next || visited.has(next.url)) {
+        continue;
+      }
+
+      visited.add(next.url);
+      await page.goto(next.url, {
+        waitUntil: "domcontentloaded",
+        timeout: Math.min(input.timeoutMs, 30_000)
+      });
+      const currentUrl = normalizeExploreUrl(page.url?.() ?? next.url);
+      if (new URL(currentUrl).origin !== origin) {
+        continue;
+      }
+
+      const html = await page.content();
+      const title = page.title ? await page.title().catch(() => extractHtmlTitle(html)) : extractHtmlTitle(html);
+      const extracted = extractProductFlowPage({
+        url: currentUrl,
+        html,
+        origin,
+        depth: next.depth,
+        options: input.options,
+        state: crawlState
+      });
+      const screenshotPath = await captureProductScreenshot({
+        page,
+        rootDir: input.rootDir,
+        artifactRoot: input.artifactRoot,
+        url: currentUrl
+      });
+
+      pages.push({
+        ...extracted,
+        title: title || extracted.title,
+        ...(screenshotPath ? { screenshotPath } : {})
+      });
+
+      for (const link of extracted.links) {
+        if (!link.discovered || queued.has(link.href) || visited.has(link.href)) {
+          continue;
+        }
+
+        queued.add(link.href);
+        queue.push({ url: link.href, depth: next.depth + 1 });
+      }
+    }
+  } finally {
+    await page.close?.();
+  }
+
+  const interactiveElements = pages.reduce((count, item) => count + item.interactiveElements.length, 0);
+  return {
+    schemaVersion: 1,
+    generatedAt: new Date().toISOString(),
+    target: {
+      id: input.target.id,
+      baseUrl: startUrl,
+      origin
+    },
+    driver: "playwright",
+    limits: {
+      sameOrigin: true,
+      maxPages: input.options.maxPages,
+      maxActions: input.options.maxActions,
+      allowDestructiveActions: input.options.allowDestructiveActions
+    },
+    summary: {
+      pages: pages.length,
+      interactiveElements,
+      blockedActions: crawlState.blockedActions.length,
+      skippedActions: crawlState.skippedActions
+    },
+    pages,
+    blockedActions: crawlState.blockedActions
+  };
+}
+
+function extractProductFlowPage(input: {
+  url: string;
+  html: string;
+  origin: string;
+  depth: number;
+  options: ProductExplorerOptions;
+  state: {
+    recordedActions: number;
+    skippedActions: number;
+    blockedActions: ProductBlockedAction[];
+  };
+}): ProductFlowPage {
+  const links = extractProductLinks(input.html, input.url, input.origin);
+  const interactiveElements: ProductInteractiveElement[] = [];
+
+  for (const link of links) {
+    appendInteractiveElement(interactiveElements, input.state, input.options, input.url, {
+      kind: "link",
+      selector: link.selector,
+      name: link.text,
+      action: link.href,
+      destructive: false,
+      blocked: false
+    });
+  }
+
+  for (const form of extractProductForms(input.html, input.url)) {
+    appendInteractiveElement(interactiveElements, input.state, input.options, input.url, form);
+  }
+
+  for (const button of extractProductButtons(input.html)) {
+    appendInteractiveElement(interactiveElements, input.state, input.options, input.url, button);
+  }
+
+  for (const inputElement of extractProductInputs(input.html)) {
+    appendInteractiveElement(interactiveElements, input.state, input.options, input.url, inputElement);
+  }
+
+  return {
+    url: input.url,
+    title: extractHtmlTitle(input.html),
+    path: new URL(input.url).pathname || "/",
+    depth: input.depth,
+    links,
+    interactiveElements
+  };
+}
+
+function appendInteractiveElement(
+  elements: ProductInteractiveElement[],
+  state: {
+    recordedActions: number;
+    skippedActions: number;
+    blockedActions: ProductBlockedAction[];
+  },
+  options: ProductExplorerOptions,
+  pageUrl: string,
+  element: ProductInteractiveElement
+): void {
+  if (state.recordedActions >= options.maxActions) {
+    state.skippedActions += 1;
+    return;
+  }
+
+  const blockedElement =
+    element.destructive && !options.allowDestructiveActions
+      ? {
+          ...element,
+          blocked: true,
+          blockReason: element.blockReason ?? "Potentially destructive product action."
+        }
+      : {
+          ...element,
+          blocked: false,
+          blockReason: undefined
+        };
+
+  elements.push(blockedElement);
+  state.recordedActions += 1;
+
+  if (blockedElement.blocked) {
+    state.blockedActions.push({
+      pageUrl,
+      selector: blockedElement.selector,
+      name: blockedElement.name,
+      reason: blockedElement.blockReason ?? "Potentially destructive product action."
+    });
+  }
+}
+
+function extractProductLinks(html: string, baseUrl: string, origin: string): ProductFlowLink[] {
+  const links: ProductFlowLink[] = [];
+  const seen = new Set<string>();
+  const anchorPattern = /<a\b([^>]*)>([\s\S]*?)<\/a>/gi;
+  let match: RegExpExecArray | null;
+
+  while ((match = anchorPattern.exec(html)) !== null) {
+    const attrs = parseHtmlAttributes(match[1] ?? "");
+    const rawHref = attrs.href;
+    if (!rawHref || rawHref.startsWith("#") || /^(mailto|tel|javascript):/i.test(rawHref)) {
+      continue;
+    }
+
+    const href = resolveMaybeUrl(rawHref, baseUrl);
+    if (!href || seen.has(href)) {
+      continue;
+    }
+
+    seen.add(href);
+    const sameOrigin = new URL(href).origin === origin;
+    links.push({
+      href,
+      text: accessibleName(attrs, stripHtml(match[2] ?? ""), rawHref),
+      selector: `a[href="${escapeSelectorValue(rawHref)}"]`,
+      sameOrigin,
+      discovered: sameOrigin
+    });
+  }
+
+  return links.sort((left, right) => left.href.localeCompare(right.href));
+}
+
+function extractProductForms(html: string, baseUrl: string): ProductInteractiveElement[] {
+  const forms: ProductInteractiveElement[] = [];
+  const formPattern = /<form\b([^>]*)>([\s\S]*?)<\/form>/gi;
+  let index = 0;
+  let match: RegExpExecArray | null;
+
+  while ((match = formPattern.exec(html)) !== null) {
+    index += 1;
+    const attrs = parseHtmlAttributes(match[1] ?? "");
+    const method = (attrs.method ?? "get").toLowerCase();
+    const rawAction = attrs.action ?? baseUrl;
+    const action = resolveMaybeUrl(rawAction, baseUrl) ?? rawAction;
+    const text = stripHtml(match[2] ?? "");
+    const name = accessibleName(attrs, text, `form ${index}`);
+    const destructive = method !== "get" || isDestructiveText(`${name} ${method} ${rawAction}`);
+
+    forms.push({
+      kind: "form",
+      selector: selectorFromAttrs("form", attrs, index),
+      name,
+      action,
+      method,
+      destructive,
+      blocked: destructive,
+      blockReason: destructive ? `Form method ${method.toUpperCase()} may mutate product state.` : undefined
+    });
+  }
+
+  return forms;
+}
+
+function extractProductButtons(html: string): ProductInteractiveElement[] {
+  const buttons: ProductInteractiveElement[] = [];
+  const buttonPattern = /<button\b([^>]*)>([\s\S]*?)<\/button>/gi;
+  let index = 0;
+  let match: RegExpExecArray | null;
+
+  while ((match = buttonPattern.exec(html)) !== null) {
+    index += 1;
+    const attrs = parseHtmlAttributes(match[1] ?? "");
+    const name = accessibleName(attrs, stripHtml(match[2] ?? ""), `button ${index}`);
+    const type = (attrs.type ?? "submit").toLowerCase();
+    const destructive = isDestructiveText(`${name} ${type}`);
+
+    buttons.push({
+      kind: "button",
+      selector: selectorFromAttrs("button", attrs, index),
+      name,
+      inputType: type,
+      destructive,
+      blocked: destructive,
+      blockReason: destructive ? "Button name or type matches a destructive action pattern." : undefined
+    });
+  }
+
+  return buttons;
+}
+
+function extractProductInputs(html: string): ProductInteractiveElement[] {
+  const inputs: ProductInteractiveElement[] = [];
+  const inputPattern = /<input\b([^>]*)>/gi;
+  let index = 0;
+  let match: RegExpExecArray | null;
+
+  while ((match = inputPattern.exec(html)) !== null) {
+    index += 1;
+    const attrs = parseHtmlAttributes(match[1] ?? "");
+    const type = (attrs.type ?? "text").toLowerCase();
+    const name = accessibleName(attrs, attrs.value ?? attrs.placeholder ?? "", `input ${index}`);
+    const destructive = ["submit", "button", "reset"].includes(type) && isDestructiveText(`${name} ${type}`);
+
+    inputs.push({
+      kind: "input",
+      selector: selectorFromAttrs("input", attrs, index),
+      name,
+      inputType: type,
+      destructive,
+      blocked: destructive,
+      blockReason: destructive ? "Input action matches a destructive action pattern." : undefined
+    });
+  }
+
+  return inputs;
+}
+
+async function captureProductScreenshot(input: {
+  page: ProductPlaywrightPage;
+  rootDir: string;
+  artifactRoot: string;
+  url: string;
+}): Promise<string | undefined> {
+  if (!input.page.screenshot) {
+    return undefined;
+  }
+
+  const screenshotPath = join(input.artifactRoot, "screenshots", `${sanitizeArtifactSegment(new URL(input.url).pathname || "root")}.png`);
+  try {
+    mkdirSync(dirname(join(input.rootDir, screenshotPath)), { recursive: true });
+    await input.page.screenshot({
+      path: join(input.rootDir, screenshotPath),
+      fullPage: true
+    });
+    return screenshotPath;
+  } catch {
+    return undefined;
+  }
+}
+
+function resolveProductExploreBaseUrl(target: CodeDecayProductTarget, health: ProductHealthResult): string | undefined {
+  const configured = target.readiness.effectiveBaseUrl ?? target.baseUrl;
+  if (configured) {
+    return normalizeExploreUrl(configured);
+  }
+
+  const healthOrigin = resolveMaybeUrl(health.url, health.url);
+  return healthOrigin ? new URL(healthOrigin).origin : undefined;
+}
+
+function normalizeExploreUrl(value: string): string {
+  const url = new URL(value);
+  url.hash = "";
+  return url.toString().replace(/\/$/, "") || url.origin;
+}
+
+function resolveMaybeUrl(value: string, baseUrl: string): string | undefined {
+  try {
+    const url = new URL(value, baseUrl);
+    if (url.protocol !== "http:" && url.protocol !== "https:") {
+      return undefined;
+    }
+    url.hash = "";
+    return url.toString().replace(/\/$/, "") || url.origin;
+  } catch {
+    return undefined;
+  }
+}
+
+function parseHtmlAttributes(raw: string): Record<string, string> {
+  const attrs: Record<string, string> = {};
+  const attrPattern = /([A-Za-z_:][-A-Za-z0-9_:.]*)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'>/=`]+)))?/g;
+  let match: RegExpExecArray | null;
+
+  while ((match = attrPattern.exec(raw)) !== null) {
+    const key = match[1]?.toLowerCase();
+    if (!key) {
+      continue;
+    }
+
+    attrs[key] = decodeHtmlEntities(match[2] ?? match[3] ?? match[4] ?? "");
+  }
+
+  return attrs;
+}
+
+function selectorFromAttrs(tag: string, attrs: Record<string, string>, index: number): string {
+  if (attrs.id) {
+    return `${tag}#${escapeSelectorValue(attrs.id)}`;
+  }
+
+  if (attrs.name) {
+    return `${tag}[name="${escapeSelectorValue(attrs.name)}"]`;
+  }
+
+  if (attrs["aria-label"]) {
+    return `${tag}[aria-label="${escapeSelectorValue(attrs["aria-label"])}"]`;
+  }
+
+  if (attrs.type) {
+    return `${tag}[type="${escapeSelectorValue(attrs.type)}"]:nth-of-type(${index})`;
+  }
+
+  return `${tag}:nth-of-type(${index})`;
+}
+
+function accessibleName(attrs: Record<string, string>, text: string, fallback: string): string {
+  const candidate = attrs["aria-label"] ?? attrs.title ?? attrs.name ?? attrs.value ?? attrs.placeholder ?? text;
+  const cleaned = normalizeWhitespace(candidate);
+  return cleaned || fallback;
+}
+
+function extractHtmlTitle(html: string): string {
+  const match = /<title\b[^>]*>([\s\S]*?)<\/title>/i.exec(html);
+  return match ? normalizeWhitespace(stripHtml(match[1] ?? "")) : "";
+}
+
+function stripHtml(value: string): string {
+  return normalizeWhitespace(decodeHtmlEntities(value.replace(/<script\b[\s\S]*?<\/script>/gi, "").replace(/<style\b[\s\S]*?<\/style>/gi, "").replace(/<[^>]+>/g, " ")));
+}
+
+function normalizeWhitespace(value: string): string {
+  return value.replace(/\s+/g, " ").trim();
+}
+
+function decodeHtmlEntities(value: string): string {
+  return value
+    .replace(/&nbsp;/g, " ")
+    .replace(/&amp;/g, "&")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'");
+}
+
+function isDestructiveText(value: string): boolean {
+  return /\b(delete|remove|destroy|drop|reset|purchase|payment|checkout|confirm|submit|disable|revoke|archive)\b/i.test(value);
+}
+
+function escapeSelectorValue(value: string): string {
+  return value.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+}
+
+function sanitizeArtifactSegment(value: string): string {
+  const sanitized = value.replace(/[^A-Za-z0-9._-]+/g, "-").replace(/^-+|-+$/g, "");
+  return sanitized || "root";
+}
+
 function createProductTargetSummary(results: ProductTargetResult[], durationMs: number): ProductTargetSummary {
   const passed = countProductStatus(results, "passed");
   const failed = countProductStatus(results, "failed");
@@ -3656,6 +4420,23 @@ function renderProductTargetMarkdown(report: ProductTargetReport): string {
       }
     }
 
+    if (target.exploration) {
+      lines.push(`  - Exploration: ${formatProductStatus(target.exploration.status)} using ${target.exploration.driver}`);
+      lines.push(`  - Flow pages: ${target.exploration.pages}`);
+      lines.push(`  - Interactive elements: ${target.exploration.interactiveElements}`);
+      lines.push(`  - Blocked actions: ${target.exploration.blockedActions}`);
+      lines.push(`  - Skipped actions: ${target.exploration.skippedActions}`);
+      if (target.exploration.artifactPath) {
+        lines.push(`  - Flow map: \`${target.exploration.artifactPath}\``);
+      }
+      if (target.exploration.error) {
+        lines.push(`  - Exploration error: ${target.exploration.error}`);
+      }
+      for (const note of target.exploration.notes) {
+        lines.push(`  - Exploration note: ${note}`);
+      }
+    }
+
     if (target.teardown) {
       lines.push(`  - Teardown: ${formatCommandExecutionStatus(target.teardown.status)} \`${target.teardown.command}\``);
       appendOutputBlock(lines, "teardown stdout", target.teardown.stdout);
@@ -3672,6 +4453,7 @@ function renderProductTargetMarkdown(report: ProductTargetReport): string {
     "### Safety",
     "",
     `- Commands executed: ${report.safety.commandsExecuted ? "yes" : "no"}`,
+    `- Browser automation ran: ${report.safety.browserAutomationRan ? "yes" : "no"}`,
     `- Startup commands allowed: ${report.safety.startupCommandsAllowed ? "yes" : "no"}`,
     "- Telemetry sent: no",
     "- Cloud dependency: no",

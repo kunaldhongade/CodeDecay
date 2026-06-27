@@ -1,0 +1,122 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://submuxhq.github.io/CodeDecay/schemas/product-flow-map.schema.json",
+  "title": "CodeDecay Product Flow Map",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "generatedAt", "target", "driver", "limits", "summary", "pages", "blockedActions"],
+  "properties": {
+    "schemaVersion": {
+      "const": 1
+    },
+    "generatedAt": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "target": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "baseUrl", "origin"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "baseUrl": { "type": "string", "format": "uri" },
+        "origin": { "type": "string", "format": "uri" }
+      }
+    },
+    "driver": {
+      "const": "playwright"
+    },
+    "limits": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["sameOrigin", "maxPages", "maxActions", "allowDestructiveActions"],
+      "properties": {
+        "sameOrigin": { "const": true },
+        "maxPages": { "type": "integer", "minimum": 1 },
+        "maxActions": { "type": "integer", "minimum": 1 },
+        "allowDestructiveActions": { "type": "boolean" }
+      }
+    },
+    "summary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["pages", "interactiveElements", "blockedActions", "skippedActions"],
+      "properties": {
+        "pages": { "type": "integer", "minimum": 0 },
+        "interactiveElements": { "type": "integer", "minimum": 0 },
+        "blockedActions": { "type": "integer", "minimum": 0 },
+        "skippedActions": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "pages": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["url", "title", "path", "depth", "links", "interactiveElements"],
+        "properties": {
+          "url": { "type": "string", "format": "uri" },
+          "title": { "type": "string" },
+          "path": { "type": "string" },
+          "depth": { "type": "integer", "minimum": 0 },
+          "screenshotPath": { "type": "string" },
+          "links": {
+            "type": "array",
+            "items": { "$ref": "#/$defs/link" }
+          },
+          "interactiveElements": {
+            "type": "array",
+            "items": { "$ref": "#/$defs/interactiveElement" }
+          }
+        }
+      }
+    },
+    "blockedActions": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/blockedAction" }
+    }
+  },
+  "$defs": {
+    "link": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["href", "text", "selector", "sameOrigin", "discovered"],
+      "properties": {
+        "href": { "type": "string", "format": "uri" },
+        "text": { "type": "string" },
+        "selector": { "type": "string" },
+        "sameOrigin": { "type": "boolean" },
+        "discovered": { "type": "boolean" }
+      }
+    },
+    "interactiveElement": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "selector", "name", "destructive", "blocked"],
+      "properties": {
+        "kind": {
+          "enum": ["link", "form", "button", "input"]
+        },
+        "selector": { "type": "string" },
+        "name": { "type": "string" },
+        "action": { "type": "string" },
+        "method": { "type": "string" },
+        "inputType": { "type": "string" },
+        "destructive": { "type": "boolean" },
+        "blocked": { "type": "boolean" },
+        "blockReason": { "type": "string" }
+      }
+    },
+    "blockedAction": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["pageUrl", "selector", "name", "reason"],
+      "properties": {
+        "pageUrl": { "type": "string", "format": "uri" },
+        "selector": { "type": "string" },
+        "name": { "type": "string" },
+        "reason": { "type": "string" }
+      }
+    }
+  }
+}

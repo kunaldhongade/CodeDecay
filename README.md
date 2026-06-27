@@ -135,6 +135,7 @@ Check configured live app product targets:
 
 ```bash
 npx codedecay product --format markdown
+npx codedecay product --target web --explore --max-pages 5 --format markdown
 ```
 
 ## Commands
@@ -152,7 +153,7 @@ npx codedecay product --format markdown
 | `codedecay memory-learn` | Learn local memory from CI, PR, and CodeDecay report signals. |
 | `codedecay execute` | Run explicitly configured local commands and OSS tool adapters. |
 | `codedecay differential` | Run configured probes on base and head and compare behavior. |
-| `codedecay product` | Check configured live app product targets with optional safe startup and teardown. |
+| `codedecay product` | Check configured live app product targets and optionally crawl product flows with project Playwright. |
 | `codedecay mcp` | Start a local MCP server for agent clients. |
 | `codedecay help` | Show root or per-command help. |
 | `codedecay man` | Show a longer manual page for a command. |
@@ -197,6 +198,7 @@ codedecay uninstall --purge-local
 | --- | --- | --- |
 | `codedecay analyze`, `redteam`, `agent`, `snapshot` | Yes | Runs deterministic local analysis with no model calls. |
 | `codedecay execute`, `differential` | No | Runs only repo-allowlisted local commands after explicit opt-in. |
+| `codedecay product --explore` | No | Uses a project-provided Playwright install to crawl configured live app targets after explicit opt-in. |
 | `codedecay llm-review` | No | Calls a user-owned provider only when the user invokes it directly. |
 | Optional LLM providers | No | Disabled by default. User-owned providers are configured explicitly and only commands that opt in may call them. |
 

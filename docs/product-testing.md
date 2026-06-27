@@ -82,6 +82,40 @@ safety:
   allowCommands: true
 ```
 
+## Playwright Flow Explorer
+
+Use `codedecay product --explore` to crawl configured product targets and write a
+stable flow map artifact.
+
+```bash
+npx codedecay product --target web --explore --max-pages 5 --format markdown
+```
+
+The explorer is intentionally conservative:
+
+- it runs only when `safety.allowCommands: true`,
+- it loads `playwright` from the target project,
+- it does not install Playwright packages or browser binaries,
+- it crawls same-origin links from the product target URL,
+- it records page URLs, titles, links, forms, buttons, inputs, selectors, and
+  accessible names,
+- it records screenshots when the project Playwright driver can provide them,
+- it blocks potentially destructive forms and actions unless
+  `--allow-destructive-actions` is passed,
+- it obeys `--max-pages` and `--max-actions`.
+
+Flow maps are written under:
+
+```text
+.codedecay/local/product-flow-maps/<target-id>/flow-map.json
+```
+
+The JSON schema lives at
+[`schemas/product-flow-map.schema.json`](schemas/product-flow-map.schema.json).
+
+Markdown and JSON product reports link to the flow-map artifact so agents and
+humans can reuse the discovered product surface as test-generation input.
+
 ## Failure Bundle Schema
 
 Product verification failures are represented as versioned bundles on
@@ -124,12 +158,12 @@ of guessing from a dashboard screenshot.
 
 ## Current Limits
 
-This release defines the target model, live health-check runner, and failure
-evidence contract. It does not yet generate UI/API tests automatically.
+This release defines the target model, live health-check runner, Playwright flow
+map explorer, and failure evidence contract. It does not yet generate UI/API
+tests automatically.
 
 The next implementation pieces are:
 
-- Playwright product explorer and flow map,
 - generated UI regression tests,
 - OpenAPI/API scenario generation,
 - MCP run-fix-rerun tools,
