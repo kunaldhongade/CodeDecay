@@ -357,6 +357,17 @@ function calculateScoreBreakdown(
     });
   }
 
+  const runtimePersistenceScore = scoreKind === "merge" ? runtimePersistenceBoundaryScore(contributors) : 0;
+  if (runtimePersistenceScore > 0) {
+    contributors.push({
+      id: "runtime-persistence-boundary",
+      label: "Runtime config plus persistence boundary",
+      points: runtimePersistenceScore,
+      evidence: "structural",
+      reason: "Runtime configuration and database/schema behavior changed together, which increases production regression risk."
+    });
+  }
+
   const rawScore = clampScore(contributors.reduce((score, contributor) => score + contributor.points, 0));
   const dampeners: ScoreContributor[] = [];
   let adjustedScore = rawScore;
@@ -411,6 +422,14 @@ function createFindingContributor(finding: Finding): ScoreContributor {
     file: finding.file,
     line: finding.line
   };
+}
+
+function runtimePersistenceBoundaryScore(contributors: ScoreContributor[]): number {
+  const hasDatabaseChange = contributors.some((contributor) => contributor.ruleId === "risky-database-change");
+  const hasConfigChange = contributors.some((contributor) => contributor.ruleId === "risky-config-change");
+  const hasHighSeveritySignal = contributors.some((contributor) => contributor.severity === "high");
+
+  return hasDatabaseChange && hasConfigChange && hasHighSeveritySignal ? 8 : 0;
 }
 
 function scoreEvidenceForFinding(finding: Finding): ScoreEvidenceKind {

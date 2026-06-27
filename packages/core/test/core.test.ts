@@ -214,6 +214,67 @@ describe("createAnalysisReport", () => {
     expect(shouldFailForRisk(report.summary.riskLevel, "high")).toBe(true);
   });
 
+  it("treats runtime config and database changes together as high production risk", () => {
+    const report = createAnalysisReport({
+      changedFiles: [
+        {
+          path: "next.config.js",
+          status: "modified",
+          additions: 8,
+          deletions: 6,
+          addedLines: [{ line: 2, content: "const sessionSecret = env.SESSION_SECRET ?? 'dev-secret';" }]
+        },
+        {
+          path: "src/db/schema.js",
+          status: "modified",
+          additions: 4,
+          deletions: 1,
+          addedLines: [{ line: 2, content: '  role: "admin",' }]
+        }
+      ],
+      analyzerResult: {
+        impactedAreas: [],
+        findings: [
+          {
+            ruleId: "risky-config-change",
+            title: "Config area changed",
+            description: "Runtime config changed.",
+            severity: "medium",
+            category: "configuration",
+            file: "next.config.js",
+            line: 2
+          },
+          {
+            ruleId: "risky-database-change",
+            title: "Database area changed",
+            description: "Database defaults changed.",
+            severity: "high",
+            category: "regression",
+            file: "src/db/schema.js",
+            line: 2
+          },
+          {
+            ruleId: "missing-nearby-tests",
+            title: "Risky source changes without changed tests",
+            description: "Risky source changed without changed tests.",
+            severity: "high",
+            category: "coverage",
+            file: "next.config.js",
+            line: 2
+          }
+        ],
+        recommendedTests: []
+      },
+      generatedAt: "2026-06-22T00:00:00.000Z"
+    });
+
+    expect(report.summary.mergeRiskScore).toBeGreaterThanOrEqual(70);
+    expect(report.summary.riskLevel).toBe("high");
+    expect(report.summary.mergeRiskBreakdown?.contributors).toEqual(
+      expect.arrayContaining([expect.objectContaining({ id: "runtime-persistence-boundary", points: 8 })])
+    );
+  });
+
   it("caps heuristic-only merge risk below high even with severe findings", () => {
     const changedFiles = createSyntheticChanges(6);
     const findings = createSyntheticFindings(4, "high", "snapshot-only-test", "coverage");

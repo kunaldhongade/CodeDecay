@@ -22,6 +22,10 @@ changes, lockfile-only changes, and package metadata-only changes stay low
 unless they are paired with source, dependency, runtime config, or structural
 changes.
 
+Runtime config plus database/schema changes receive a small structural lift.
+That combination is treated as production-sensitive because it can change
+deployment defaults and persisted behavior in the same PR.
+
 ## Decay Score
 
 Decay score estimates whether the PR makes the codebase harder to maintain.
