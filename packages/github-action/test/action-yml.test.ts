@@ -14,7 +14,15 @@ describe("GitHub Action metadata", () => {
       "format",
       "head",
       "mode",
-      "output"
+      "output",
+      "preview-url",
+      "product-explore",
+      "product-fail-on-classification",
+      "product-generate-api-tests",
+      "product-generate-tests",
+      "product-run-generated-api-tests",
+      "product-run-generated-tests",
+      "target"
     ]);
     expect(action.inputs.mode.default).toBe("analyze");
   });
@@ -27,13 +35,28 @@ describe("GitHub Action metadata", () => {
     expect(invocations.every((line) => line.includes("--cwd \"${{ inputs.cwd }}\""))).toBe(true);
   });
 
-  it("supports only report-only modes", () => {
+  it("supports report modes and explicit product verification only", () => {
     const actionYaml = readFileSync("packages/github-action/action.yml", "utf8");
 
-    expect(actionYaml).toContain("analyze|redteam|agent");
+    expect(actionYaml).toContain("analyze|redteam|agent|product");
+    expect(actionYaml).toContain('args=("product" --cwd "${{ inputs.cwd }}" --format "$FORMAT")');
     expect(actionYaml).toContain("Unsupported CodeDecay mode");
     expect(actionYaml).toContain("does not support SARIF output");
-    expect(actionYaml).not.toContain("analyze|redteam|agent|execute");
+    expect(actionYaml).not.toContain("analyze|redteam|agent|product|execute");
+  });
+
+  it("wires product verification inputs without arbitrary command passthrough", () => {
+    const actionYaml = readFileSync("packages/github-action/action.yml", "utf8");
+
+    expect(actionYaml).toContain('export CODEDECAY_PRODUCT_PREVIEW_URL="${{ inputs.preview-url }}"');
+    expect(actionYaml).toContain('args+=(--target "${{ inputs.target }}")');
+    expect(actionYaml).toContain("args+=(--explore)");
+    expect(actionYaml).toContain("args+=(--generate-tests)");
+    expect(actionYaml).toContain("args+=(--run-generated-tests)");
+    expect(actionYaml).toContain("args+=(--generate-api-tests)");
+    expect(actionYaml).toContain("args+=(--run-generated-api-tests)");
+    expect(actionYaml).toContain('args+=(--fail-on-classification "${{ inputs.product-fail-on-classification }}")');
+    expect(actionYaml).not.toContain("product-extra-args");
   });
 
   it("does not forward fail-on to agent mode", () => {

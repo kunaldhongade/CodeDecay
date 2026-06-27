@@ -141,6 +141,7 @@ interface ProductOptions {
   runGeneratedTests: boolean;
   generateApiTests: boolean;
   runGeneratedApiTests: boolean;
+  failOnClassifications?: ProductFailureClassification[] | undefined;
   maxPages: number;
   maxActions: number;
   allowDestructiveActions: boolean;
@@ -640,6 +641,14 @@ type ConfigFormat = "json" | "markdown";
 const VALID_FORMATS = new Set<ReportFormat>(["json", "markdown", "sarif"]);
 const VALID_CONFIG_FORMATS = new Set<ConfigFormat>(["json", "markdown"]);
 const VALID_RISK_LEVELS = new Set<RiskLevel>(["low", "medium", "high"]);
+const VALID_PRODUCT_FAILURE_CLASSIFICATIONS = new Set<ProductFailureClassification>([
+  "confirmed-regression",
+  "likely-flaky",
+  "environment-failure",
+  "auth-or-test-data-failure",
+  "generated-test-weakness",
+  "unknown"
+]);
 const VALID_PACKAGE_MANAGERS = new Set<PackageManager>(["npm", "pnpm", "yarn", "bun"]);
 const PACKAGE_NAME = "@submuxhq/codedecay";
 const COMMAND_ORDER = ["analyze", "snapshot", "redteam", "llm-review", "agent", "config", "memory", "memory-import", "memory-learn", "execute", "differential", "product", "mcp"] as const;
@@ -894,6 +903,7 @@ const HELP_DOCS: Record<string, CommandDoc> = {
       { flag: "--generate-api-tests", description: "Generate reviewable API regression tests from a configured OpenAPI schema" },
       { flag: "--run-generated-api-tests", description: "Run generated API tests through the target repo's local Playwright CLI" },
       { flag: "--test-id <id>", description: "When rerunning generated tests, target one generated test ID" },
+      { flag: "--fail-on-classification <list>", description: "For product failures, exit non-zero only when a failure bundle has one of these comma-separated classifications" },
       { flag: "--max-pages <count>", description: "Maximum pages to visit during --explore (default: 10)" },
       { flag: "--max-actions <count>", description: "Maximum interactive elements to record during --explore (default: 50)" },
       { flag: "--allow-destructive-actions", description: "Record destructive forms/actions as allowed instead of blocked" },
@@ -906,6 +916,7 @@ const HELP_DOCS: Record<string, CommandDoc> = {
       "codedecay product --target web --explore --max-pages 5 --format markdown",
       "codedecay product --target web --generate-tests --run-generated-tests --format markdown",
       "codedecay product --target api --generate-api-tests --run-generated-api-tests --format markdown",
+      "codedecay product --target api --generate-api-tests --run-generated-api-tests --fail-on-classification confirmed-regression --format markdown",
       "codedecay product --target api --run-generated-api-tests --test-id api-get-users --format markdown"
     ],
     notes: [
@@ -1332,8 +1343,23 @@ async function runProductCommand(context: CliCommandContext): Promise<void> {
   });
 
   if (isProductTargetFailure(report.summary.status)) {
-    throw new CliExit(1);
+    const shouldFail =
+      options.failOnClassifications && options.failOnClassifications.length > 0
+        ? shouldFailProductReportForClassifications(report, options.failOnClassifications)
+        : true;
+    if (shouldFail) {
+      throw new CliExit(1);
+    }
   }
+}
+
+function shouldFailProductReportForClassifications(
+  report: ProductTargetReport,
+  classifications: ProductFailureClassification[]
+): boolean {
+  const failures = productFailureBundlesFromProductTargetReport(report);
+  const gate = new Set(classifications);
+  return failures.some((failure) => gate.has(failure.classification));
 }
 
 async function runDifferentialCommand(context: CliCommandContext): Promise<void> {
@@ -2201,6 +2227,17 @@ function parseProductArgs(args: string[]): ProductOptions {
       continue;
     }
 
+    if (arg.startsWith("--fail-on-classification=")) {
+      options.failOnClassifications = parseProductFailureClassifications(arg.slice("--fail-on-classification=".length), "--fail-on-classification");
+      continue;
+    }
+
+    if (arg === "--fail-on-classification") {
+      options.failOnClassifications = parseProductFailureClassifications(requireValue(args, index, arg), arg);
+      index += 1;
+      continue;
+    }
+
     if (arg === "--explore") {
       options.explore = true;
       continue;
@@ -2856,6 +2893,26 @@ function parseRiskLevel(value: string): RiskLevel {
   }
 
   throw new Error(`Invalid risk level "${value}". Expected low, medium, or high.`);
+}
+
+function parseProductFailureClassifications(value: string, flag: string): ProductFailureClassification[] {
+  const classifications = value
+    .split(",")
+    .map((item) => item.trim())
+    .filter(Boolean);
+
+  if (classifications.length === 0) {
+    throw new Error(`${flag} requires at least one classification.`);
+  }
+
+  const invalid = classifications.find((classification) => !VALID_PRODUCT_FAILURE_CLASSIFICATIONS.has(classification as ProductFailureClassification));
+  if (invalid) {
+    throw new Error(
+      `Invalid product failure classification "${invalid}". Expected ${[...VALID_PRODUCT_FAILURE_CLASSIFICATIONS].join(", ")}.`
+    );
+  }
+
+  return classifications as ProductFailureClassification[];
 }
 
 function parsePackageManager(value: string): PackageManager {

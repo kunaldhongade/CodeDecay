@@ -4,7 +4,7 @@ author: "SubmuxHQ"
 
 inputs:
   mode:
-    description: "Report mode: analyze, redteam, or agent. Command-executing modes are not supported by this action."
+    description: "Mode: analyze, redteam, agent, or product. Product mode runs only explicit codedecay product workflows."
     required: false
     default: "analyze"
   base:
@@ -31,6 +31,38 @@ inputs:
     description: "Fail the workflow on low, medium, or high risk"
     required: false
     default: ""
+  target:
+    description: "Product mode target id to run"
+    required: false
+    default: ""
+  preview-url:
+    description: "Product mode preview URL exported as CODEDECAY_PRODUCT_PREVIEW_URL"
+    required: false
+    default: ""
+  product-explore:
+    description: "Product mode: crawl same-origin product flows"
+    required: false
+    default: "false"
+  product-generate-tests:
+    description: "Product mode: generate reviewable UI tests"
+    required: false
+    default: "false"
+  product-run-generated-tests:
+    description: "Product mode: run generated UI tests"
+    required: false
+    default: "false"
+  product-generate-api-tests:
+    description: "Product mode: generate reviewable API tests"
+    required: false
+    default: "false"
+  product-run-generated-api-tests:
+    description: "Product mode: run generated API tests"
+    required: false
+    default: "false"
+  product-fail-on-classification:
+    description: "Product mode: comma-separated failure classifications that should fail the workflow"
+    required: false
+    default: ""
 
 runs:
   using: "composite"
@@ -54,11 +86,15 @@ runs:
         SUMMARY_PATH="$RUNNER_TEMP/codedecay-summary.md"
         MODE="${{ inputs.mode }}"
 
+        if [[ "$MODE" == "product" ]]; then
+          exit 0
+        fi
+
         case "$MODE" in
           analyze|redteam|agent) ;;
           *)
             echo "Unsupported CodeDecay mode: $MODE" >&2
-            echo "Expected analyze, redteam, or agent." >&2
+            echo "Expected analyze, redteam, agent, or product." >&2
             exit 2
             ;;
         esac
@@ -83,15 +119,22 @@ runs:
         CLI_PATH="$ACTION_ROOT/packages/cli/dist/index.js"
         MODE="${{ inputs.mode }}"
         FORMAT="${{ inputs.format }}"
+        SUMMARY_PATH="$RUNNER_TEMP/codedecay-product-summary.md"
 
         case "$MODE" in
-          analyze|redteam|agent) ;;
+          analyze|redteam|agent|product) ;;
           *)
             echo "Unsupported CodeDecay mode: $MODE" >&2
-            echo "Expected analyze, redteam, or agent." >&2
+            echo "Expected analyze, redteam, agent, or product." >&2
             exit 2
             ;;
         esac
+
+        if [[ "$MODE" == "product" && "$FORMAT" == "sarif" ]]; then
+          echo "CodeDecay mode 'product' does not support SARIF output." >&2
+          echo "Use format: markdown or json." >&2
+          exit 2
+        fi
 
         if [[ "$MODE" != "analyze" && "$FORMAT" == "sarif" ]]; then
           echo "CodeDecay mode '$MODE' does not support SARIF output." >&2
@@ -99,19 +142,73 @@ runs:
           exit 2
         fi
 
-        args=("$MODE" --cwd "${{ inputs.cwd }}" --format "$FORMAT")
-        if [[ -n "${{ inputs.base }}" ]]; then
-          args+=(--base "${{ inputs.base }}")
-        fi
-        if [[ -n "${{ inputs.head }}" ]]; then
-          args+=(--head "${{ inputs.head }}")
-        fi
-        if [[ -n "${{ inputs.output }}" ]]; then
-          args+=(--output "${{ inputs.output }}")
-        fi
-        if [[ "$MODE" != "agent" && -n "${{ inputs.fail-on }}" ]]; then
-          args+=(--fail-on "${{ inputs.fail-on }}")
+        if [[ "$MODE" == "product" ]]; then
+          args=("product" --cwd "${{ inputs.cwd }}" --format "$FORMAT")
+          if [[ -n "${{ inputs.target }}" ]]; then
+            args+=(--target "${{ inputs.target }}")
+          fi
+          if [[ -n "${{ inputs.preview-url }}" ]]; then
+            export CODEDECAY_PRODUCT_PREVIEW_URL="${{ inputs.preview-url }}"
+          fi
+          if [[ "${{ inputs.product-explore }}" == "true" ]]; then
+            args+=(--explore)
+          fi
+          if [[ "${{ inputs.product-generate-tests }}" == "true" ]]; then
+            args+=(--generate-tests)
+          fi
+          if [[ "${{ inputs.product-run-generated-tests }}" == "true" ]]; then
+            args+=(--run-generated-tests)
+          fi
+          if [[ "${{ inputs.product-generate-api-tests }}" == "true" ]]; then
+            args+=(--generate-api-tests)
+          fi
+          if [[ "${{ inputs.product-run-generated-api-tests }}" == "true" ]]; then
+            args+=(--run-generated-api-tests)
+          fi
+          if [[ -n "${{ inputs.product-fail-on-classification }}" ]]; then
+            args+=(--fail-on-classification "${{ inputs.product-fail-on-classification }}")
+          fi
+          if [[ -n "${{ inputs.output }}" ]]; then
+            args+=(--output "${{ inputs.output }}")
+          fi
+        else
+          args=("$MODE" --cwd "${{ inputs.cwd }}" --format "$FORMAT")
+          if [[ -n "${{ inputs.base }}" ]]; then
+            args+=(--base "${{ inputs.base }}")
+          fi
+          if [[ -n "${{ inputs.head }}" ]]; then
+            args+=(--head "${{ inputs.head }}")
+          fi
+          if [[ -n "${{ inputs.output }}" ]]; then
+            args+=(--output "${{ inputs.output }}")
+          fi
+          if [[ "$MODE" != "agent" && -n "${{ inputs.fail-on }}" ]]; then
+            args+=(--fail-on "${{ inputs.fail-on }}")
+          fi
         fi
 
         cd "$GITHUB_WORKSPACE"
-        node "$CLI_PATH" "${args[@]}"
+        if [[ "$MODE" == "product" && "$FORMAT" == "markdown" ]]; then
+          set +e
+          if [[ -n "${{ inputs.output }}" ]]; then
+            node "$CLI_PATH" "${args[@]}"
+            status=$?
+            output_path="${{ inputs.output }}"
+            if [[ "$output_path" = /* ]]; then
+              summary_source="$output_path"
+            else
+              summary_source="$GITHUB_WORKSPACE/${{ inputs.cwd }}/$output_path"
+            fi
+            if [[ -f "$summary_source" ]]; then
+              cat "$summary_source" >> "$GITHUB_STEP_SUMMARY"
+            fi
+          else
+            node "$CLI_PATH" "${args[@]}" | tee "$SUMMARY_PATH"
+            status=$?
+            cat "$SUMMARY_PATH" >> "$GITHUB_STEP_SUMMARY"
+          fi
+          set -e
+          exit "$status"
+        else
+          node "$CLI_PATH" "${args[@]}"
+        fi

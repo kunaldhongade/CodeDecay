@@ -2081,6 +2081,56 @@ describe("codedecay product CLI contract", () => {
     }
   });
 
+  it("gates product failures by selected classification", async () => {
+    const server = await startDemoAppServer();
+    const repo = createLowRiskRepo();
+    installFakePlaywright(repo);
+    writeFile(repo, "fail-generated-tests.txt", "yes\n");
+    writeProductTargetConfig(repo, {
+      baseUrl: server.origin,
+      allowCommands: true
+    });
+
+    try {
+      const reportOnly = await run(
+        [
+          "product",
+          "--explore",
+          "--generate-tests",
+          "--run-generated-tests",
+          "--max-pages",
+          "5",
+          "--fail-on-classification",
+          "likely-flaky",
+          "--format",
+          "json"
+        ],
+        repo
+      );
+      const strictGate = await run(
+        [
+          "product",
+          "--explore",
+          "--generate-tests",
+          "--run-generated-tests",
+          "--max-pages",
+          "5",
+          "--fail-on-classification",
+          "confirmed-regression",
+          "--format",
+          "json"
+        ],
+        repo
+      );
+
+      expect(reportOnly.exitCode).toBe(0);
+      expect(JSON.parse(reportOnly.stdout).summary.status).toBe("failed");
+      expect(strictGate.exitCode).toBe(1);
+    } finally {
+      await server.close();
+    }
+  });
+
   it("generates reviewable API tests from a configured OpenAPI schema", async () => {
     const server = await startDemoApiServer();
     const repo = createLowRiskRepo();
