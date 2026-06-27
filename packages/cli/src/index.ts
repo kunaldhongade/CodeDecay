@@ -124,6 +124,8 @@ interface ProductOptions {
   output?: string | undefined;
   target?: string | undefined;
   explore: boolean;
+  generateTests: boolean;
+  runGeneratedTests: boolean;
   maxPages: number;
   maxActions: number;
   allowDestructiveActions: boolean;
@@ -228,6 +230,8 @@ interface ProductTargetResult {
   start?: ProductStartResult | undefined;
   health?: ProductHealthResult | undefined;
   exploration?: ProductExplorationResult | undefined;
+  generatedTests?: ProductGeneratedTestsResult | undefined;
+  generatedTestRun?: ProductGeneratedTestRunResult | undefined;
   teardown?: CommandExecutionResult | undefined;
   notes: string[];
 }
@@ -267,6 +271,65 @@ interface ProductExplorationResult {
   durationMs: number;
   error?: string | undefined;
   notes: string[];
+}
+
+interface ProductGeneratedTestsResult {
+  status: ProductTargetStatus;
+  sourcePath?: string | undefined;
+  manifestPath?: string | undefined;
+  tests: ProductGeneratedTestCase[];
+  durationMs: number;
+  error?: string | undefined;
+  notes: string[];
+}
+
+interface ProductGeneratedTestCase {
+  id: string;
+  title: string;
+  kind: "route-load" | "link-navigation" | "input-state" | "form-visibility";
+  pageUrl: string;
+  selector?: string | undefined;
+  targetUrl?: string | undefined;
+  priority: "high" | "medium" | "low";
+}
+
+interface ProductGeneratedTestManifest {
+  schemaVersion: 1;
+  generatedAt: string;
+  target: {
+    id: string;
+    baseUrl: string;
+  };
+  sourceFlowMapPath: string;
+  testSourcePath: string;
+  reviewRequired: true;
+  promoteByCopyingTo: string;
+  tests: ProductGeneratedTestCase[];
+}
+
+interface ProductGeneratedTestRunResult {
+  status: ProductTargetStatus;
+  command?: string | undefined;
+  durationMs: number;
+  passed: number;
+  failed: number;
+  skipped: number;
+  failures: ProductGeneratedTestFailure[];
+  stdout: string;
+  stderr: string;
+  exitCode?: number | undefined;
+  error?: string | undefined;
+  notes: string[];
+}
+
+interface ProductGeneratedTestFailure {
+  testId?: string | undefined;
+  title: string;
+  failingStep: string;
+  error: string;
+  testSourcePath: string;
+  testSource: string;
+  rerunCommand: string;
 }
 
 interface ProductExplorerOptions {
@@ -340,6 +403,7 @@ interface ProductBlockedAction {
 interface ProductTargetSafetySummary {
   commandsExecuted: boolean;
   browserAutomationRan: boolean;
+  generatedTestsRan: boolean;
   startupCommandsAllowed: boolean;
   telemetrySent: false;
   cloudDependency: false;
@@ -776,6 +840,8 @@ const HELP_DOCS: Record<string, CommandDoc> = {
       { flag: "--cwd <path>", description: "Repository working directory (default: current directory)" },
       { flag: "--target <id>", description: "Run only one configured product target" },
       { flag: "--explore", description: "Use a project-provided Playwright install to crawl same-origin product flows" },
+      { flag: "--generate-tests", description: "Generate reviewable Playwright regression tests from the target flow map" },
+      { flag: "--run-generated-tests", description: "Run generated Playwright tests through the target repo's local Playwright CLI" },
       { flag: "--max-pages <count>", description: "Maximum pages to visit during --explore (default: 10)" },
       { flag: "--max-actions <count>", description: "Maximum interactive elements to record during --explore (default: 50)" },
       { flag: "--allow-destructive-actions", description: "Record destructive forms/actions as allowed instead of blocked" },
@@ -785,12 +851,14 @@ const HELP_DOCS: Record<string, CommandDoc> = {
     examples: [
       "codedecay product --format markdown",
       "codedecay product --target web --format json",
-      "codedecay product --target web --explore --max-pages 5 --format markdown"
+      "codedecay product --target web --explore --max-pages 5 --format markdown",
+      "codedecay product --target web --generate-tests --run-generated-tests --format markdown"
     ],
     notes: [
       "Product target commands run only when they are configured and `safety.allowCommands` is true.",
       "Existing `baseUrl` and preview URL targets are checked without starting commands.",
-      "`--explore` is an explicit execution workflow and requires `safety.allowCommands: true` plus a project-provided Playwright install."
+      "`--explore` is an explicit execution workflow and requires `safety.allowCommands: true` plus a project-provided Playwright install.",
+      "Generated tests are written under `.codedecay/local/generated-tests/` for review; CodeDecay never commits or promotes them automatically."
     ]
   },
   mcp: {
@@ -2012,6 +2080,8 @@ function parseProductArgs(args: string[]): ProductOptions {
   const options: ProductOptions = {
     format: "markdown",
     explore: false,
+    generateTests: false,
+    runGeneratedTests: false,
     maxPages: 10,
     maxActions: 50,
     allowDestructiveActions: false
@@ -2052,6 +2122,16 @@ function parseProductArgs(args: string[]): ProductOptions {
 
     if (arg === "--explore") {
       options.explore = true;
+      continue;
+    }
+
+    if (arg === "--generate-tests") {
+      options.generateTests = true;
+      continue;
+    }
+
+    if (arg === "--run-generated-tests") {
+      options.runGeneratedTests = true;
       continue;
     }
 
@@ -3297,6 +3377,19 @@ function appendOutputBlock(lines: string[], label: string, output: string): void
   lines.push("    ```");
 }
 
+function appendCodeBlock(lines: string[], language: string, source: string): void {
+  const trimmed = source.trim();
+  if (!trimmed) {
+    return;
+  }
+
+  lines.push(`    \`\`\`${language}`);
+  for (const line of trimmed.split(/\r?\n/)) {
+    lines.push(`    ${line}`);
+  }
+  lines.push("    ```");
+}
+
 function trimLongOutput(output: string): string {
   const limit = 2000;
   if (output.length <= limit) {
@@ -3349,6 +3442,7 @@ async function createProductTargetReport(
     safety: {
       commandsExecuted: results.some((result) => commandActuallyExecuted(result.setup) || commandActuallyExecuted(result.teardown) || result.start?.status === "started"),
       browserAutomationRan: results.some((result) => result.exploration?.status === "passed" || result.exploration?.status === "failed"),
+      generatedTestsRan: results.some((result) => result.generatedTestRun !== undefined),
       startupCommandsAllowed: loadedConfig.config.safety.allowCommands,
       telemetrySent: false,
       cloudDependency: false,
@@ -3356,7 +3450,8 @@ async function createProductTargetReport(
         "Product target checks are explicit and local-first.",
         "CodeDecay only runs configured product target commands when safety.allowCommands is true.",
         "Existing baseUrl and preview URL targets can be health-checked without startup commands.",
-        "Product exploration uses a project-provided Playwright install and never installs browsers."
+        "Product exploration uses a project-provided Playwright install and never installs browsers.",
+        "Generated tests are review artifacts unless --run-generated-tests is explicitly used."
       ]
     }
   };
@@ -3394,6 +3489,8 @@ async function runProductTarget(
   let startResult: ManagedProductProcess | undefined;
   let health: ProductHealthResult | undefined;
   let exploration: ProductExplorationResult | undefined;
+  let generatedTests: ProductGeneratedTestsResult | undefined;
+  let generatedTestRun: ProductGeneratedTestRunResult | undefined;
   let teardown: CommandExecutionResult | undefined;
   let status: ProductTargetStatus = "skipped";
   let shouldRunHealthCheck = true;
@@ -3454,6 +3551,20 @@ async function runProductTarget(
         };
       }
     }
+
+    if (options.generateTests || options.runGeneratedTests) {
+      generatedTests = options.generateTests
+        ? generateProductTestsForTarget(rootDir, target, exploration?.artifactPath)
+        : loadGeneratedProductTestsForTarget(rootDir, target);
+      if (generatedTests.status !== "passed") {
+        status = generatedTests.status;
+      } else if (options.runGeneratedTests) {
+        generatedTestRun = await runGeneratedProductTests(rootDir, loadedConfig, target, generatedTests);
+        if (generatedTestRun.status !== "passed") {
+          status = generatedTestRun.status;
+        }
+      }
+    }
   } finally {
     if (startResult?.child) {
       await stopManagedProductProcess(startResult.child);
@@ -3468,7 +3579,7 @@ async function runProductTarget(
     }
   }
 
-  return createProductTargetResult(target, status, startedAt, notes, setup, startResult, health, exploration, teardown);
+  return createProductTargetResult(target, status, startedAt, notes, setup, startResult, health, exploration, generatedTests, generatedTestRun, teardown);
 }
 
 function createProductTargetResult(
@@ -3480,6 +3591,8 @@ function createProductTargetResult(
   start: ManagedProductProcess | undefined,
   health: ProductHealthResult | undefined,
   exploration: ProductExplorationResult | undefined,
+  generatedTests: ProductGeneratedTestsResult | undefined,
+  generatedTestRun: ProductGeneratedTestRunResult | undefined,
   teardown: CommandExecutionResult | undefined
 ): ProductTargetResult {
   const result: ProductTargetResult = {
@@ -3508,6 +3621,14 @@ function createProductTargetResult(
 
   if (exploration) {
     result.exploration = exploration;
+  }
+
+  if (generatedTests) {
+    result.generatedTests = generatedTests;
+  }
+
+  if (generatedTestRun) {
+    result.generatedTestRun = generatedTestRun;
   }
 
   if (teardown) {
@@ -4282,6 +4403,687 @@ function sanitizeArtifactSegment(value: string): string {
   return sanitized || "root";
 }
 
+function generateProductTestsForTarget(
+  rootDir: string,
+  target: CodeDecayProductTarget,
+  flowMapArtifactPath: string | undefined
+): ProductGeneratedTestsResult {
+  const startedAt = Date.now();
+  const notes = [
+    "Generated tests are written for review and are never committed or promoted automatically.",
+    "Locator strategy prefers roles, labels, placeholders, and visible text before selector fallbacks."
+  ];
+  const sourceFlowMapPath = flowMapArtifactPath ?? defaultProductFlowMapPath(target.id);
+
+  if (!existsSync(join(rootDir, sourceFlowMapPath))) {
+    return {
+      status: "blocked",
+      tests: [],
+      durationMs: elapsed(startedAt),
+      error: `Flow map artifact not found at ${sourceFlowMapPath}. Run codedecay product --target ${target.id} --explore first.`,
+      notes
+    };
+  }
+
+  let flowMap: ProductFlowMap;
+  try {
+    flowMap = JSON.parse(readFileSync(join(rootDir, sourceFlowMapPath), "utf8")) as ProductFlowMap;
+  } catch (error: unknown) {
+    const message = error instanceof Error ? error.message : String(error);
+    return {
+      status: "failed",
+      tests: [],
+      durationMs: elapsed(startedAt),
+      error: `Could not read flow map ${sourceFlowMapPath}: ${message}`,
+      notes
+    };
+  }
+
+  const impactedPaths = findImpactedProductPaths(rootDir);
+  const tests = createGeneratedProductTestCases(flowMap, impactedPaths);
+  if (tests.length === 0) {
+    return {
+      status: "blocked",
+      tests: [],
+      durationMs: elapsed(startedAt),
+      error: "Flow map did not contain enough safe route, link, input, or form evidence to generate tests.",
+      notes
+    };
+  }
+
+  const testSourcePath = join(".codedecay", "local", "generated-tests", sanitizeArtifactSegment(target.id), "product.generated.spec.ts");
+  const manifestPath = join(".codedecay", "local", "generated-tests", sanitizeArtifactSegment(target.id), "manifest.json");
+  const source = renderGeneratedProductTestSource(flowMap, tests, sourceFlowMapPath);
+  const manifest: ProductGeneratedTestManifest = {
+    schemaVersion: 1,
+    generatedAt: new Date().toISOString(),
+    target: {
+      id: target.id,
+      baseUrl: flowMap.target.baseUrl
+    },
+    sourceFlowMapPath,
+    testSourcePath,
+    reviewRequired: true,
+    promoteByCopyingTo: "tests/e2e/codedecay-product.spec.ts",
+    tests
+  };
+
+  writeOutput(rootDir, testSourcePath, source);
+  writeOutput(rootDir, manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+
+  return {
+    status: "passed",
+    sourcePath: testSourcePath,
+    manifestPath,
+    tests,
+    durationMs: elapsed(startedAt),
+    notes
+  };
+}
+
+function loadGeneratedProductTestsForTarget(rootDir: string, target: CodeDecayProductTarget): ProductGeneratedTestsResult {
+  const startedAt = Date.now();
+  const manifestPath = defaultProductGeneratedTestManifestPath(target.id);
+  const notes = [
+    "Loaded existing generated tests without regenerating source.",
+    "Review edits are preserved when using --run-generated-tests without --generate-tests."
+  ];
+
+  if (!existsSync(join(rootDir, manifestPath))) {
+    return {
+      status: "blocked",
+      tests: [],
+      durationMs: elapsed(startedAt),
+      error: `Generated test manifest not found at ${manifestPath}. Run codedecay product --target ${target.id} --generate-tests first.`,
+      notes
+    };
+  }
+
+  try {
+    const manifest = JSON.parse(readFileSync(join(rootDir, manifestPath), "utf8")) as ProductGeneratedTestManifest;
+    if (!manifest.testSourcePath || !existsSync(join(rootDir, manifest.testSourcePath))) {
+      return {
+        status: "blocked",
+        manifestPath,
+        tests: manifest.tests ?? [],
+        durationMs: elapsed(startedAt),
+        error: `Generated test source not found at ${manifest.testSourcePath}. Run codedecay product --target ${target.id} --generate-tests first.`,
+        notes
+      };
+    }
+
+    return {
+      status: "passed",
+      sourcePath: manifest.testSourcePath,
+      manifestPath,
+      tests: manifest.tests ?? [],
+      durationMs: elapsed(startedAt),
+      notes
+    };
+  } catch (error: unknown) {
+    const message = error instanceof Error ? error.message : String(error);
+    return {
+      status: "failed",
+      manifestPath,
+      tests: [],
+      durationMs: elapsed(startedAt),
+      error: `Could not read generated test manifest ${manifestPath}: ${message}`,
+      notes
+    };
+  }
+}
+
+async function runGeneratedProductTests(
+  rootDir: string,
+  loadedConfig: LoadedCodeDecayConfig,
+  target: CodeDecayProductTarget,
+  generatedTests: ProductGeneratedTestsResult
+): Promise<ProductGeneratedTestRunResult> {
+  const startedAt = Date.now();
+  const notes = [
+    "Generated tests run only from the local generated-tests artifact path.",
+    "Use the rerun command after reviewing or editing the generated test source."
+  ];
+
+  if (!generatedTests.sourcePath || generatedTests.tests.length === 0) {
+    return {
+      status: "blocked",
+      durationMs: elapsed(startedAt),
+      passed: 0,
+      failed: 0,
+      skipped: 0,
+      failures: [],
+      stdout: "",
+      stderr: "",
+      error: "Generated test source is missing; run --generate-tests first.",
+      notes
+    };
+  }
+
+  if (!loadedConfig.config.safety.allowCommands) {
+    return {
+      status: "blocked",
+      durationMs: elapsed(startedAt),
+      passed: 0,
+      failed: 0,
+      skipped: 0,
+      failures: [],
+      stdout: "",
+      stderr: "Generated test execution is disabled by config safety.allowCommands.",
+      error: "Generated test execution requires safety.allowCommands to be true.",
+      notes
+    };
+  }
+
+  const command = resolveProjectPlaywrightTestCommand(rootDir, generatedTests.sourcePath);
+  if (!command.ok) {
+    return {
+      status: "blocked",
+      durationMs: elapsed(startedAt),
+      passed: 0,
+      failed: 0,
+      skipped: 0,
+      failures: [],
+      stdout: "",
+      stderr: command.error,
+      error: command.error,
+      notes: [...notes, "Install Playwright in the target project; CodeDecay does not install packages or browsers."]
+    };
+  }
+
+  const execution = await runConfiguredCommand({
+    command: command.command,
+    cwd: rootDir,
+    timeoutMs: target.timeoutMs,
+    env: {
+      CODEDECAY_PRODUCT_BASE_URL: generatedProductBaseUrl(rootDir, generatedTests)
+    },
+    safety: {
+      allowCommands: loadedConfig.config.safety.allowCommands
+    }
+  });
+  const testSource = readFileSync(join(rootDir, generatedTests.sourcePath), "utf8");
+  const parsed = parsePlaywrightTestRun({
+    stdout: execution.stdout,
+    generatedTests,
+    testSource,
+    target
+  });
+  const failed = parsed.failed > 0 || execution.status !== "passed";
+  const fallbackFailures =
+    failed && parsed.failures.length === 0
+      ? [
+          createGeneratedTestFailure({
+            title: "Generated Playwright command",
+            failingStep: "Run generated Playwright regression tests.",
+            error: execution.error ?? (execution.stderr.trim() || `Playwright command exited with status ${execution.status}.`),
+            generatedTests,
+            testSource,
+            target
+          })
+        ]
+      : parsed.failures;
+
+  return {
+    status: failed ? "failed" : "passed",
+    command: command.command,
+    durationMs: elapsed(startedAt),
+    passed: parsed.passed,
+    failed: failed ? Math.max(parsed.failed, fallbackFailures.length) : parsed.failed,
+    skipped: parsed.skipped,
+    failures: fallbackFailures,
+    stdout: execution.stdout,
+    stderr: execution.stderr,
+    exitCode: execution.exitCode,
+    error: failed ? execution.error : undefined,
+    notes
+  };
+}
+
+function createGeneratedProductTestCases(flowMap: ProductFlowMap, impactedPaths: Set<string>): ProductGeneratedTestCase[] {
+  const tests: ProductGeneratedTestCase[] = [];
+  const pages = [...flowMap.pages].sort((left, right) => left.depth - right.depth || left.url.localeCompare(right.url));
+  const seen = new Set<string>();
+
+  for (const page of pages) {
+    addGeneratedTestCase(tests, seen, {
+      id: generatedTestId("route", page.path),
+      title: `loads ${page.path || "/"}`,
+      kind: "route-load",
+      pageUrl: page.url,
+      priority: priorityForPath(page.path, impactedPaths)
+    });
+  }
+
+  for (const page of pages) {
+    const links = page.links
+      .filter((link) => link.sameOrigin && link.discovered && link.text.trim().length > 0)
+      .sort((left, right) => left.href.localeCompare(right.href));
+
+    for (const link of links) {
+      addGeneratedTestCase(tests, seen, {
+        id: generatedTestId("link", page.path, new URL(link.href).pathname, link.text),
+        title: `navigates from ${page.path || "/"} to ${new URL(link.href).pathname || "/"} via ${link.text}`,
+        kind: "link-navigation",
+        pageUrl: page.url,
+        selector: link.selector,
+        targetUrl: link.href,
+        priority: priorityForPath(new URL(link.href).pathname, impactedPaths)
+      });
+    }
+  }
+
+  for (const page of pages) {
+    const inputs = page.interactiveElements
+      .filter((element) => element.kind === "input" && !element.blocked && safeInputType(element.inputType))
+      .sort((left, right) => left.selector.localeCompare(right.selector));
+
+    for (const input of inputs) {
+      addGeneratedTestCase(tests, seen, {
+        id: generatedTestId("input", page.path, input.name, input.selector),
+        title: `fills ${input.name} on ${page.path || "/"}`,
+        kind: "input-state",
+        pageUrl: page.url,
+        selector: input.selector,
+        priority: priorityForPath(page.path, impactedPaths)
+      });
+    }
+  }
+
+  for (const page of pages) {
+    const forms = page.interactiveElements
+      .filter((element) => element.kind === "form" && !element.blocked)
+      .sort((left, right) => left.selector.localeCompare(right.selector));
+
+    for (const form of forms) {
+      addGeneratedTestCase(tests, seen, {
+        id: generatedTestId("form", page.path, form.name, form.selector),
+        title: `shows safe form ${form.name} on ${page.path || "/"}`,
+        kind: "form-visibility",
+        pageUrl: page.url,
+        selector: form.selector,
+        priority: priorityForPath(page.path, impactedPaths)
+      });
+    }
+  }
+
+  return tests.sort((left, right) => priorityRank(left.priority) - priorityRank(right.priority) || left.id.localeCompare(right.id));
+}
+
+function addGeneratedTestCase(tests: ProductGeneratedTestCase[], seen: Set<string>, test: ProductGeneratedTestCase): void {
+  if (seen.has(test.id)) {
+    return;
+  }
+
+  seen.add(test.id);
+  tests.push(test);
+}
+
+function renderGeneratedProductTestSource(flowMap: ProductFlowMap, tests: ProductGeneratedTestCase[], sourceFlowMapPath: string): string {
+  const lines = [
+    "import { test, expect } from '@playwright/test';",
+    "",
+    "// @generated by CodeDecay. Review before promoting into your permanent test suite.",
+    `// codedecay:source-flow-map=${sourceFlowMapPath}`,
+    `// codedecay:target=${flowMap.target.id}`,
+    "",
+    `const CODEDECAY_BASE_URL = process.env.CODEDECAY_PRODUCT_BASE_URL ?? ${JSON.stringify(flowMap.target.baseUrl)};`,
+    "",
+    "function productUrl(path: string): string {",
+    "  return new URL(path, CODEDECAY_BASE_URL.endsWith('/') ? CODEDECAY_BASE_URL : `${CODEDECAY_BASE_URL}/`).toString();",
+    "}",
+    "",
+    `test.describe(${JSON.stringify(`CodeDecay generated product regression tests (${flowMap.target.id})`)}, () => {`
+  ];
+
+  for (const testCase of tests) {
+    lines.push("", `  test(${JSON.stringify(testCase.title)}, async ({ page }) => {`, `    test.info().annotations.push({ type: 'codedecay.testId', description: ${JSON.stringify(testCase.id)} });`);
+    appendGeneratedTestBody(lines, testCase, flowMap);
+    lines.push("  });");
+  }
+
+  lines.push("});", "");
+  return lines.join("\n");
+}
+
+function appendGeneratedTestBody(lines: string[], testCase: ProductGeneratedTestCase, flowMap: ProductFlowMap): void {
+  const page = findFlowPageForTest(flowMap, testCase.pageUrl);
+  const pagePath = new URL(testCase.pageUrl).pathname || "/";
+
+  if (testCase.kind === "route-load") {
+    lines.push(`    await page.goto(productUrl(${JSON.stringify(pagePath)}));`);
+    lines.push("    await expect(page.locator('body')).toBeVisible();");
+    if (page?.title) {
+      lines.push(`    await expect(page).toHaveTitle(${regexLiteralForText(page.title)});`);
+    }
+    return;
+  }
+
+  if (testCase.kind === "link-navigation") {
+    const link = page?.links.find((candidate) => candidate.href === testCase.targetUrl || candidate.selector === testCase.selector);
+    lines.push(`    await page.goto(productUrl(${JSON.stringify(pagePath)}));`);
+    lines.push(`    await ${locatorForInteractiveElement("link", link?.text ?? testCase.title, testCase.selector)}.click();`);
+    lines.push(`    await expect(page).toHaveURL(productUrl(${JSON.stringify(new URL(testCase.targetUrl ?? testCase.pageUrl).pathname || "/")}));`);
+    return;
+  }
+
+  if (testCase.kind === "input-state") {
+    const element = page?.interactiveElements.find((candidate) => candidate.selector === testCase.selector);
+    const sampleValue = sampleValueForInput(element?.inputType, element?.name);
+    lines.push(`    await page.goto(productUrl(${JSON.stringify(pagePath)}));`);
+    lines.push(`    const field = ${locatorForInteractiveElement("input", element?.name ?? testCase.title, testCase.selector)};`);
+    lines.push(`    await field.fill(${JSON.stringify(sampleValue)});`);
+    lines.push(`    await expect(field).toHaveValue(${JSON.stringify(sampleValue)});`);
+    return;
+  }
+
+  const element = page?.interactiveElements.find((candidate) => candidate.selector === testCase.selector);
+  lines.push(`    await page.goto(productUrl(${JSON.stringify(pagePath)}));`);
+  lines.push(`    await expect(${locatorForInteractiveElement("form", element?.name ?? testCase.title, testCase.selector)}).toBeVisible();`);
+}
+
+function locatorForInteractiveElement(kind: "link" | "input" | "form", name: string, selector: string | undefined): string {
+  const safeName = normalizeWhitespace(name);
+  const fallback = selector ? `.or(page.locator(${JSON.stringify(selector)}))` : "";
+  if (kind === "link") {
+    return `page.getByRole('link', { name: ${regexLiteralForText(safeName)} }).first()${fallback}`;
+  }
+
+  if (kind === "input") {
+    return `page.getByLabel(${regexLiteralForText(safeName)}).or(page.getByPlaceholder(${regexLiteralForText(safeName)}))${fallback}.first()`;
+  }
+
+  return selector ? `page.locator(${JSON.stringify(selector)}).first()` : `page.getByRole('form', { name: ${regexLiteralForText(safeName)} }).first()`;
+}
+
+function findFlowPageForTest(flowMap: ProductFlowMap, url: string): ProductFlowPage | undefined {
+  return flowMap.pages.find((page) => page.url === url);
+}
+
+function resolveProjectPlaywrightTestCommand(
+  rootDir: string,
+  sourcePath: string
+): { ok: true; command: string } | { ok: false; error: string } {
+  const absoluteSourcePath = join(rootDir, sourcePath);
+  const candidates = [
+    join(rootDir, "node_modules", "playwright", "cli.js"),
+    join(rootDir, "node_modules", "@playwright", "test", "cli.js")
+  ];
+
+  for (const candidate of candidates) {
+    if (existsSync(candidate)) {
+      return {
+        ok: true,
+        command: `${shellQuote(process.execPath)} ${shellQuote(candidate)} test ${shellQuote(absoluteSourcePath)} --reporter=json`
+      };
+    }
+  }
+
+  const bin = join(rootDir, "node_modules", ".bin", process.platform === "win32" ? "playwright.cmd" : "playwright");
+  if (existsSync(bin)) {
+    return {
+      ok: true,
+      command: `${shellQuote(bin)} test ${shellQuote(absoluteSourcePath)} --reporter=json`
+    };
+  }
+
+  return {
+    ok: false,
+    error: "Could not find a project-local Playwright CLI in node_modules/playwright, node_modules/@playwright/test, or node_modules/.bin."
+  };
+}
+
+function parsePlaywrightTestRun(input: {
+  stdout: string;
+  generatedTests: ProductGeneratedTestsResult;
+  testSource: string;
+  target: CodeDecayProductTarget;
+}): { passed: number; failed: number; skipped: number; failures: ProductGeneratedTestFailure[] } {
+  const parsed = parseJsonFromOutput(input.stdout);
+  if (!parsed || typeof parsed !== "object") {
+    return {
+      passed: 0,
+      failed: 0,
+      skipped: 0,
+      failures: []
+    };
+  }
+
+  const specs = collectPlaywrightSpecs(parsed);
+  if (specs.length === 0) {
+    return {
+      passed: input.generatedTests.tests.length,
+      failed: 0,
+      skipped: 0,
+      failures: []
+    };
+  }
+
+  let passed = 0;
+  let failed = 0;
+  let skipped = 0;
+  const failures: ProductGeneratedTestFailure[] = [];
+
+  for (const spec of specs) {
+    const title = typeof spec.title === "string" ? spec.title : "Generated Playwright test";
+    const matchingTest = input.generatedTests.tests.find((test) => test.title === title || title.includes(test.title));
+    const testEntries = Array.isArray(spec.tests) ? spec.tests : [];
+    const resultEntries = testEntries.flatMap((testEntry) => (Array.isArray(testEntry.results) ? testEntry.results : []));
+    const statuses = resultEntries.map((result) => String(result.status ?? "")).filter(Boolean);
+    const hasFailure = statuses.some((status) => ["failed", "timedOut", "interrupted"].includes(status)) || spec.ok === false;
+    const hasSkip = statuses.some((status) => status === "skipped") || testEntries.some((testEntry) => testEntry.status === "skipped");
+
+    if (hasFailure) {
+      failed += 1;
+      const firstFailedResult = resultEntries.find((result) => ["failed", "timedOut", "interrupted"].includes(String(result.status ?? "")));
+      failures.push(
+        createGeneratedTestFailure({
+          testId: matchingTest?.id,
+          title,
+          failingStep: `Run generated test "${title}".`,
+          error: extractPlaywrightError(firstFailedResult) ?? extractPlaywrightError(spec) ?? "Generated Playwright test failed.",
+          generatedTests: input.generatedTests,
+          testSource: input.testSource,
+          target: input.target
+        })
+      );
+    } else if (hasSkip) {
+      skipped += 1;
+    } else {
+      passed += 1;
+    }
+  }
+
+  return {
+    passed,
+    failed,
+    skipped,
+    failures
+  };
+}
+
+function collectPlaywrightSpecs(value: unknown): Array<Record<string, any>> {
+  const specs: Array<Record<string, any>> = [];
+  visit(value);
+  return specs;
+
+  function visit(node: unknown): void {
+    if (!node || typeof node !== "object") {
+      return;
+    }
+
+    const record = node as Record<string, any>;
+    if (Array.isArray(record.tests) && typeof record.title === "string") {
+      specs.push(record);
+    }
+
+    for (const key of ["suites", "specs", "children"]) {
+      if (Array.isArray(record[key])) {
+        for (const child of record[key]) {
+          visit(child);
+        }
+      }
+    }
+  }
+}
+
+function createGeneratedTestFailure(input: {
+  testId?: string | undefined;
+  title: string;
+  failingStep: string;
+  error: string;
+  generatedTests: ProductGeneratedTestsResult;
+  testSource: string;
+  target: CodeDecayProductTarget;
+}): ProductGeneratedTestFailure {
+  return {
+    testId: input.testId,
+    title: input.title,
+    failingStep: input.failingStep,
+    error: input.error,
+    testSourcePath: input.generatedTests.sourcePath ?? "",
+    testSource: input.testSource,
+    rerunCommand: `npx codedecay product --target ${input.target.id} --run-generated-tests --format markdown`
+  };
+}
+
+function parseJsonFromOutput(output: string): unknown {
+  const trimmed = output.trim();
+  if (!trimmed) {
+    return undefined;
+  }
+
+  try {
+    return JSON.parse(trimmed);
+  } catch {
+    const firstBrace = trimmed.indexOf("{");
+    const lastBrace = trimmed.lastIndexOf("}");
+    if (firstBrace === -1 || lastBrace === -1 || lastBrace <= firstBrace) {
+      return undefined;
+    }
+
+    try {
+      return JSON.parse(trimmed.slice(firstBrace, lastBrace + 1));
+    } catch {
+      return undefined;
+    }
+  }
+}
+
+function extractPlaywrightError(value: any): string | undefined {
+  if (!value || typeof value !== "object") {
+    return undefined;
+  }
+
+  if (typeof value.error?.message === "string") {
+    return value.error.message;
+  }
+
+  if (Array.isArray(value.errors) && typeof value.errors[0]?.message === "string") {
+    return value.errors[0].message;
+  }
+
+  if (typeof value.message === "string") {
+    return value.message;
+  }
+
+  return undefined;
+}
+
+function generatedProductBaseUrl(rootDir: string, generatedTests: ProductGeneratedTestsResult): string | undefined {
+  if (!generatedTests.manifestPath || !existsSync(join(rootDir, generatedTests.manifestPath))) {
+    return undefined;
+  }
+
+  try {
+    const manifest = JSON.parse(readFileSync(join(rootDir, generatedTests.manifestPath), "utf8")) as ProductGeneratedTestManifest;
+    return manifest.target.baseUrl;
+  } catch {
+    return undefined;
+  }
+}
+
+function defaultProductFlowMapPath(targetId: string): string {
+  return join(".codedecay", "local", "product-flow-maps", sanitizeArtifactSegment(targetId), "flow-map.json");
+}
+
+function defaultProductGeneratedTestManifestPath(targetId: string): string {
+  return join(".codedecay", "local", "generated-tests", sanitizeArtifactSegment(targetId), "manifest.json");
+}
+
+function findImpactedProductPaths(rootDir: string): Set<string> {
+  try {
+    const repoRoot = getRepoRoot(rootDir);
+    const analysis = createAnalysisContextForCli(repoRoot, { format: "markdown" });
+    return new Set((analysis.report.impactedRoutes ?? []).map((route) => route.route));
+  } catch {
+    return new Set();
+  }
+}
+
+function priorityForPath(path: string, impactedPaths: Set<string>): ProductGeneratedTestCase["priority"] {
+  return impactedPaths.has(path) ? "high" : "medium";
+}
+
+function priorityRank(priority: ProductGeneratedTestCase["priority"]): number {
+  if (priority === "high") {
+    return 0;
+  }
+
+  if (priority === "medium") {
+    return 1;
+  }
+
+  return 2;
+}
+
+function safeInputType(inputType: string | undefined): boolean {
+  return ["text", "email", "search", "tel", "url", "password", undefined].includes(inputType);
+}
+
+function sampleValueForInput(inputType: string | undefined, name: string | undefined): string {
+  const normalized = `${inputType ?? ""} ${name ?? ""}`.toLowerCase();
+  if (normalized.includes("email")) {
+    return "codedecay@example.com";
+  }
+
+  if (normalized.includes("phone") || normalized.includes("tel")) {
+    return "5550100";
+  }
+
+  if (normalized.includes("url")) {
+    return "https://example.com";
+  }
+
+  if (normalized.includes("password")) {
+    return "CodeDecayTest123!";
+  }
+
+  return "CodeDecay test";
+}
+
+function generatedTestId(...parts: string[]): string {
+  return parts
+    .join("-")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 96);
+}
+
+function regexLiteralForText(value: string): string {
+  const escaped = normalizeWhitespace(value).replace(/[\\^$.*+?()[\]{}|]/g, "\\$&");
+  return `/${escaped}/i`;
+}
+
+function shellQuote(value: string): string {
+  if (/^[A-Za-z0-9_/:=.,@%+-]+$/.test(value)) {
+    return value;
+  }
+
+  return `'${value.replace(/'/g, "'\\''")}'`;
+}
+
 function createProductTargetSummary(results: ProductTargetResult[], durationMs: number): ProductTargetSummary {
   const passed = countProductStatus(results, "passed");
   const failed = countProductStatus(results, "failed");
@@ -4437,6 +5239,47 @@ function renderProductTargetMarkdown(report: ProductTargetReport): string {
       }
     }
 
+    if (target.generatedTests) {
+      lines.push(`  - Generated tests: ${formatProductStatus(target.generatedTests.status)} (${target.generatedTests.tests.length} test(s))`);
+      if (target.generatedTests.sourcePath) {
+        lines.push(`  - Generated test source: \`${target.generatedTests.sourcePath}\``);
+      }
+      if (target.generatedTests.manifestPath) {
+        lines.push(`  - Generated test manifest: \`${target.generatedTests.manifestPath}\``);
+      }
+      if (target.generatedTests.error) {
+        lines.push(`  - Generated test error: ${target.generatedTests.error}`);
+      }
+      for (const generatedTest of target.generatedTests.tests.slice(0, 8)) {
+        lines.push(`  - Test: ${generatedTest.priority} ${generatedTest.kind} \`${generatedTest.id}\` ${generatedTest.title}`);
+      }
+      for (const note of target.generatedTests.notes) {
+        lines.push(`  - Generated test note: ${note}`);
+      }
+    }
+
+    if (target.generatedTestRun) {
+      lines.push(`  - Generated test run: ${formatProductStatus(target.generatedTestRun.status)}`);
+      if (target.generatedTestRun.command) {
+        lines.push(`  - Generated test command: \`${target.generatedTestRun.command}\``);
+      }
+      lines.push(`  - Generated test results: ${target.generatedTestRun.passed} passed, ${target.generatedTestRun.failed} failed, ${target.generatedTestRun.skipped} skipped`);
+      if (target.generatedTestRun.error) {
+        lines.push(`  - Generated test run error: ${target.generatedTestRun.error}`);
+      }
+      for (const failure of target.generatedTestRun.failures) {
+        lines.push(`  - Failure: ${failure.title}`);
+        lines.push(`  - Failing step: ${failure.failingStep}`);
+        lines.push(`  - Error: ${failure.error}`);
+        lines.push(`  - Rerun: \`${failure.rerunCommand}\``);
+        lines.push(`  - Test source path: \`${failure.testSourcePath}\``);
+        appendCodeBlock(lines, "ts", failure.testSource);
+      }
+      for (const note of target.generatedTestRun.notes) {
+        lines.push(`  - Generated test run note: ${note}`);
+      }
+    }
+
     if (target.teardown) {
       lines.push(`  - Teardown: ${formatCommandExecutionStatus(target.teardown.status)} \`${target.teardown.command}\``);
       appendOutputBlock(lines, "teardown stdout", target.teardown.stdout);
@@ -4454,6 +5297,7 @@ function renderProductTargetMarkdown(report: ProductTargetReport): string {
     "",
     `- Commands executed: ${report.safety.commandsExecuted ? "yes" : "no"}`,
     `- Browser automation ran: ${report.safety.browserAutomationRan ? "yes" : "no"}`,
+    `- Generated tests ran: ${report.safety.generatedTestsRan ? "yes" : "no"}`,
     `- Startup commands allowed: ${report.safety.startupCommandsAllowed ? "yes" : "no"}`,
     "- Telemetry sent: no",
     "- Cloud dependency: no",

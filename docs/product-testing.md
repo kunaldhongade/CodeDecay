@@ -116,6 +116,69 @@ The JSON schema lives at
 Markdown and JSON product reports link to the flow-map artifact so agents and
 humans can reuse the discovered product surface as test-generation input.
 
+## Generated UI Regression Tests
+
+Use `codedecay product --generate-tests` to turn a flow map into reviewable
+Playwright regression tests.
+
+```bash
+npx codedecay product --target web --generate-tests --format markdown
+```
+
+Generated tests are written under:
+
+```text
+.codedecay/local/generated-tests/<target-id>/product.generated.spec.ts
+.codedecay/local/generated-tests/<target-id>/manifest.json
+```
+
+The manifest marks the tests as generated, stores the source flow-map path, and
+requires review before promotion. Its JSON schema lives at
+[`schemas/product-generated-test-manifest.schema.json`](schemas/product-generated-test-manifest.schema.json).
+
+Generated tests are deterministic review artifacts:
+
+- CodeDecay never commits generated tests automatically,
+- generated tests prefer role, label, placeholder, text, and accessibility-first
+  locators before selector fallbacks,
+- generated tests cover route loads, same-origin link navigation, safe input
+  state, and safe form visibility,
+- destructive or mutating actions blocked in the flow map are not converted into
+  submit/click tests,
+- tests touched by the current PR blast radius are marked higher priority when
+  CodeDecay can infer route impact.
+
+Run generated tests explicitly with:
+
+```bash
+npx codedecay product --target web --generate-tests --run-generated-tests --format markdown
+```
+
+Execution uses the target repository's local Playwright CLI from
+`node_modules/playwright`, `node_modules/@playwright/test`, or
+`node_modules/.bin/playwright`. CodeDecay does not install Playwright or browser
+binaries.
+
+When a generated test fails, the product report includes:
+
+- failing generated test title,
+- failing step,
+- error message,
+- exact generated test source,
+- source path,
+- rerun command.
+
+Review/promote workflow:
+
+1. Run `codedecay product --target web --explore --generate-tests`.
+2. Inspect `.codedecay/local/generated-tests/<target-id>/product.generated.spec.ts`.
+3. Edit weak selectors or sample data if needed.
+4. Run `codedecay product --target web --run-generated-tests`.
+5. Copy reviewed tests into your real test suite, for example
+   `tests/e2e/codedecay-product.spec.ts`.
+6. Commit only the reviewed promoted tests, not the `.codedecay/local/`
+   generated artifacts.
+
 ## Failure Bundle Schema
 
 Product verification failures are represented as versioned bundles on
@@ -159,12 +222,11 @@ of guessing from a dashboard screenshot.
 ## Current Limits
 
 This release defines the target model, live health-check runner, Playwright flow
-map explorer, and failure evidence contract. It does not yet generate UI/API
-tests automatically.
+map explorer, generated UI regression tests, and failure evidence contract. It
+does not yet generate API tests automatically.
 
 The next implementation pieces are:
 
-- generated UI regression tests,
 - OpenAPI/API scenario generation,
 - MCP run-fix-rerun tools,
 - retained product-test memory,
