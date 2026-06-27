@@ -67,6 +67,11 @@ The learner converts those signals into flows, commands, architecture notes,
 and past regressions. It infers impacted areas from file paths and text such as
 `auth`, `api`, `schema`, `migration`, `workflow`, or `coverage`.
 
+For CodeDecay report inputs, `memory-learn` keeps only actionable findings that
+include concrete evidence such as a file, impacted area, or recommended check.
+Generic self-referential gate output without evidence is ignored so the memory
+file does not learn `CodeDecay finding` placeholders as real regressions.
+
 For product verification reports, `memory-learn` keeps only reviewable metadata:
 passed generated test titles, target ids, product route/API paths, impacted
 files, and rerun commands. It does not store generated test source, stdout,

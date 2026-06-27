@@ -733,6 +733,39 @@ describe("analyzeJsProject", () => {
     expect(result.testEvidence?.changedSources[0]?.status).toBe("partial");
   });
 
+  it("maps Python changed sources through LCOV runtime coverage", () => {
+    const rootDir = createTempProject({
+      "src/auth.py": ["def refresh_token(token):", "    return token", ""].join("\n")
+    });
+    mkdirSync(dirname(join(rootDir, "coverage/lcov.info")), { recursive: true });
+    writeFileSync(
+      join(rootDir, "coverage/lcov.info"),
+      [`SF:${join(rootDir, "src/auth.py")}`, "DA:1,1", "DA:2,0", "end_of_record", ""].join("\n")
+    );
+
+    const result = analyzeJsProject({
+      rootDir,
+      changedFiles: [
+        {
+          path: "src/auth.py",
+          status: "modified",
+          additions: 2,
+          deletions: 0,
+          addedLines: [
+            { line: 1, content: "def refresh_token(token):" },
+            { line: 2, content: "    return token" }
+          ]
+        }
+      ]
+    });
+
+    expect(result.testEvidence?.mode).toBe("runtime_augmented");
+    expect(result.testEvidence?.changedSources).toEqual(
+      expect.arrayContaining([expect.objectContaining({ path: "src/auth.py", status: "partial", uncoveredLines: [2] })])
+    );
+    expect(result.findings.map((finding) => finding.ruleId)).toContain("runtime-coverage-partial");
+  });
+
   it("loads V8 coverage artifacts for changed source files", () => {
     const fileContents = ["export function listUsers() {", "  return [];", "}", ""].join("\n");
     const rootDir = createTempProject({

@@ -886,23 +886,25 @@ function calculateScoreBreakdown(
   const dampeners: ScoreContributor[] = [];
   let adjustedScore = rawScore;
 
-  if (scoreKind === "merge" && heuristicOnly) {
+  if (heuristicOnly) {
+    const scoreLabel = scoreKind === "merge" ? "Merge risk" : "Decay";
     const dampenerPoints = Math.min(16, Math.max(4, Math.round(rawScore * 0.25)));
     dampeners.push({
       id: "heuristic-only-dampener",
       label: "Heuristic-only dampener",
       points: -dampenerPoints,
       evidence: "heuristic",
-      reason: "Merge risk stays conservative until direct regression, configuration, or runtime coverage evidence exists."
+      reason: `${scoreLabel} stays conservative until direct evidence exists.`
     });
     adjustedScore = clampScore(adjustedScore - dampenerPoints);
   }
 
   let score = capScoreByHighestSeverity(adjustedScore, relevantFindings);
   const notes: string[] = [];
-  if (scoreKind === "merge" && heuristicOnly) {
+  if (heuristicOnly) {
+    const scoreLabel = scoreKind === "merge" ? "merge risk" : "decay";
     score = Math.min(score, 54);
-    notes.push("Heuristic-only merge risk is capped at 54/100 until direct regression, configuration, or runtime coverage evidence exists.");
+    notes.push(`Heuristic-only ${scoreLabel} is capped at 54/100 until direct evidence exists.`);
   }
 
   if (changeSizeScore === 0 && fileSpreadScore === 0 && relevantFindings.length > 0) {

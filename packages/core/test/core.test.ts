@@ -532,6 +532,29 @@ describe("createAnalysisReport", () => {
       expect.arrayContaining([expect.objectContaining({ id: "heuristic-only-dampener" })])
     );
   });
+
+  it("caps heuristic-only decay so proximity findings do not force high risk", () => {
+    const changedFiles = createSyntheticChanges(6);
+    const findings = createSyntheticFindings(6, "high", "high-complexity", "decay");
+
+    const report = createAnalysisReport({
+      changedFiles,
+      analyzerResult: {
+        impactedAreas: [],
+        findings,
+        recommendedTests: []
+      },
+      generatedAt: "2026-06-22T00:00:00.000Z"
+    });
+
+    expect(report.summary.mergeRiskScore).toBe(0);
+    expect(report.summary.decayScore).toBeLessThanOrEqual(54);
+    expect(report.summary.riskLevel).not.toBe("high");
+    expect(report.summary.decayBreakdown?.heuristicOnly).toBe(true);
+    expect(report.summary.decayBreakdown?.dampeners).toEqual(
+      expect.arrayContaining([expect.objectContaining({ id: "heuristic-only-dampener" })])
+    );
+  });
 });
 
 function createSyntheticChanges(count: number): FileChange[] {

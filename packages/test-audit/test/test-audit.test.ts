@@ -114,6 +114,25 @@ describe("createTestProofAudit", () => {
     ]);
   });
 
+  it("treats Python files as source changes for test-proof audit", () => {
+    const audit = createTestProofAudit(
+      createReport({
+        changedFiles: [sourceChange("src/auth.py")],
+        analyzerResult: {
+          impactedAreas: [],
+          findings: [],
+          recommendedTests: []
+        }
+      })
+    );
+
+    expect(audit.status).toBe("missing");
+    expect(audit.changedSourceFiles).toEqual(["src/auth.py"]);
+    expect(audit.recommendedChecks).toContain(
+      "Add or run tests that exercise src/auth.py through its public behavior path."
+    );
+  });
+
   it("marks docs-only changes as not applicable", () => {
     const audit = createTestProofAudit(
       createReport({

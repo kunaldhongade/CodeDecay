@@ -26,6 +26,11 @@ Current coverage sources:
 - LCOV `lcov.info`
 - V8 JSON coverage
 
+Changed source classification currently includes JavaScript, TypeScript, and
+Python (`.py`) files. Python projects should provide LCOV or another supported
+coverage artifact from their own test runner; CodeDecay maps the artifact to
+changed lines but does not run pytest automatically.
+
 ## Statuses
 
 - `missing`: changed source behavior does not have nearby changed test evidence.

@@ -311,6 +311,65 @@ describe("CodeDecay memory", () => {
     );
   });
 
+  it("skips self-referential CodeDecay gate findings without concrete evidence", () => {
+    const result = learnCodeDecayMemory(
+      {
+        version: 1,
+        flows: [],
+        commands: [],
+        invariants: [],
+        architecture: [],
+        regressions: []
+      },
+      {
+        tool: "CodeDecay",
+        findings: [{ severity: "high" }]
+      },
+      "codedecay-gate.json"
+    );
+
+    expect(result.learned.regressions).toBe(0);
+    expect(result.memory.regressions).toEqual([]);
+  });
+
+  it("keeps unrelated same-title CI failures as separate regressions", () => {
+    const result = learnCodeDecayMemory(
+      {
+        version: 1,
+        flows: [],
+        commands: [],
+        invariants: [],
+        architecture: [],
+        regressions: []
+      },
+      {
+        ciFailures: [
+          {
+            title: "pytest failed",
+            message: "Billing refund flow returned 500 after gateway timeout.",
+            command: "pytest tests/billing/test_refunds.py"
+          },
+          {
+            title: "pytest failed",
+            message: "Auth refresh accepted an expired token after clock skew.",
+            command: "pytest tests/auth/test_refresh.py"
+          }
+        ]
+      },
+      "ci-failures.json"
+    );
+
+    expect(result.learned.regressions).toBe(2);
+    expect(result.added.regressions).toBe(2);
+    expect(result.memory.regressions).toHaveLength(2);
+    expect(result.memory.regressions.map((regression) => regression.description)).toEqual(
+      expect.arrayContaining([
+        "Billing refund flow returned 500 after gateway timeout.",
+        "Auth refresh accepted an expired token after clock skew."
+      ])
+    );
+  });
+
   it("learns product memory from failed and passing generated product checks", () => {
     const result = learnCodeDecayMemory(
       {

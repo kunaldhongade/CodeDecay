@@ -567,6 +567,10 @@ function appendLearnedCodeDecayReport(memory: CodeDecayMemory, report: Record<st
       optionalString(finding.description, "CodeDecay report", "finding.description") ??
       `CodeDecay finding ${title} was learned from a blocked or reviewed report.`;
     const file = optionalString(finding.file, "CodeDecay report", "finding.file");
+    if (!isActionableLearnedCodeDecayFinding({ file, reportAreas, recommendedTests })) {
+      continue;
+    }
+
     const matcher = inferMemoryMatcher(
       {
         files: file ? [file] : undefined,
@@ -583,6 +587,14 @@ function appendLearnedCodeDecayReport(memory: CodeDecayMemory, report: Record<st
       ...matcher
     });
   }
+}
+
+function isActionableLearnedCodeDecayFinding(input: {
+  file: string | undefined;
+  reportAreas: ImpactedArea["kind"][];
+  recommendedTests: string[];
+}): boolean {
+  return Boolean(input.file) || input.reportAreas.length > 0 || input.recommendedTests.length > 0;
 }
 
 function appendLearnedProductReport(memory: CodeDecayMemory, report: Record<string, unknown>): void {
@@ -1206,7 +1218,7 @@ function mergeRegressionEntries(
   added: MemoryImportCounts,
   merged: MemoryImportCounts
 ): MemoryRegression[] {
-  return sortRegressions(mergeNamedEntries(baseEntries, importedEntries, "regressions", added, merged, mergeRegression));
+  return sortRegressions(mergeNamedEntries(baseEntries, importedEntries, "regressions", added, merged, mergeRegression, regressionKey));
 }
 
 function mergeNamedEntries<
@@ -1223,11 +1235,12 @@ function mergeNamedEntries<
   section: keyof MemoryImportCounts,
   added: MemoryImportCounts,
   merged: MemoryImportCounts,
-  mergeEntry: (existing: T, incoming: T) => T
+  mergeEntry: (existing: T, incoming: T) => T,
+  keyForEntry: (entry: T) => string = namedKey
 ): T[] {
-  const map = new Map(baseEntries.map((entry) => [namedKey(entry), structuredCloneEntry(entry)]));
+  const map = new Map(baseEntries.map((entry) => [keyForEntry(entry), structuredCloneEntry(entry)]));
   for (const entry of importedEntries) {
-    const key = namedKey(entry);
+    const key = keyForEntry(entry);
     const existing = map.get(key);
     if (!existing) {
       map.set(key, structuredCloneEntry(entry));
@@ -1436,7 +1449,25 @@ function commandKey(command: MemoryCommand): string {
 }
 
 function namedKey(entry: { name?: string; title?: string }): string {
-  return (entry.name ?? entry.title ?? "").trim().toLowerCase();
+  return normalizeMemoryKey(entry.name ?? entry.title ?? "");
+}
+
+function regressionKey(entry: MemoryRegression): string {
+  const title = normalizeMemoryKey(entry.title);
+  const files = normalizeMemoryKey(dedupeStrings(entry.files ?? []).join(","));
+  const areas = normalizeMemoryKey(dedupeStrings(entry.areas ?? []).join(","));
+  const productPaths = normalizeMemoryKey(dedupeStrings(entry.productPaths ?? []).join(","));
+  const hasMatcherContext = Boolean(files || areas || productPaths);
+
+  if (hasMatcherContext) {
+    return [title, files, areas, productPaths].join("::");
+  }
+
+  return [title, normalizeMemoryKey(entry.check ?? ""), normalizeMemoryKey(entry.description).slice(0, 160)].join("::");
+}
+
+function normalizeMemoryKey(value: string): string {
+  return value.trim().toLowerCase().replace(/\s+/g, " ");
 }
 
 function firstDefinedString(left: string | undefined, right: string | undefined): string | undefined {

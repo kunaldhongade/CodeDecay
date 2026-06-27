@@ -51,9 +51,10 @@ low-severity merge-risk findings stays low, even if many low findings are
 present. A report with only medium-severity merge-risk findings stays at most
 medium. High risk requires high-severity evidence.
 
-When a merge-risk score is built only from heuristic signals, CodeDecay applies
-a dampener so broad low-signal diffs do not escalate into headline high risk
-without direct regression evidence.
+When a merge-risk or decay score is built only from heuristic signals,
+CodeDecay applies a dampener and caps that breakdown at `54/100` so broad
+low-signal diffs do not escalate into headline high risk without direct
+evidence.
 
 The v1 scoring model is deterministic. The same diff should produce the same
 score.
