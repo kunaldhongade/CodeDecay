@@ -179,6 +179,78 @@ Review/promote workflow:
 6. Commit only the reviewed promoted tests, not the `.codedecay/local/`
    generated artifacts.
 
+## Generated API Regression Tests
+
+Use `codedecay product --generate-api-tests` to turn an OpenAPI schema into
+reviewable Playwright API request tests.
+
+```yaml
+version: 1
+
+toolAdapters:
+  schemathesis:
+    schema: docs/openapi.yaml
+    baseUrl: http://127.0.0.1:3000
+
+productTesting:
+  targets:
+    api:
+      baseUrl: http://127.0.0.1:3000
+      healthCheck: http://127.0.0.1:3000/health
+
+safety:
+  allowCommands: true
+```
+
+```bash
+npx codedecay product --target api --generate-api-tests --format markdown
+npx codedecay product --target api --generate-api-tests --run-generated-api-tests --format markdown
+```
+
+CodeDecay reads local OpenAPI JSON/YAML files from
+`toolAdapters.schemathesis.schema`. If no schema is configured, it looks for
+common local filenames such as `openapi.yaml`, `docs/openapi.yaml`, or
+`api/openapi.yaml`. HTTP(S) schema URLs are not fetched by the product command
+yet; provide a local schema file to keep generation deterministic and
+local-first.
+
+Generated API tests are written under:
+
+```text
+.codedecay/local/generated-api-tests/<target-id>/api.generated.spec.ts
+.codedecay/local/generated-api-tests/<target-id>/manifest.json
+```
+
+The same manifest schema is used for UI and API generated tests:
+[`schemas/product-generated-test-manifest.schema.json`](schemas/product-generated-test-manifest.schema.json).
+
+Generated API tests are conservative by default:
+
+- safe methods (`GET`, `HEAD`, `OPTIONS`) run normally,
+- mutating methods (`POST`, `PUT`, `PATCH`, `DELETE`) are generated as
+  `test.skip` review cases unless `--allow-destructive-actions` is passed,
+- required path and query parameters are filled with deterministic sample
+  values,
+- request bodies are sampled from OpenAPI examples, defaults, enums, required
+  object fields, and primitive schema types when available,
+- checks pass for documented non-5xx statuses and fail unexpected server errors
+  or undocumented responses,
+- generated failures include request method/URL, expected behavior, actual
+  error, impacted files when available, source path, exact generated source,
+  and rerun command.
+
+Review/promote workflow:
+
+1. Run `codedecay product --target api --generate-api-tests`.
+2. Inspect `.codedecay/local/generated-api-tests/<target-id>/api.generated.spec.ts`.
+3. Replace sample IDs, auth setup, fixtures, or destructive test skips as
+   needed.
+4. Run `codedecay product --target api --run-generated-api-tests`.
+5. Copy reviewed tests into your real test suite, for example
+   `tests/api/codedecay-api.spec.ts`.
+6. Commit only the reviewed promoted tests, not the `.codedecay/local/`
+   generated artifacts.
+
 ## Failure Bundle Schema
 
 Product verification failures are represented as versioned bundles on
@@ -222,12 +294,11 @@ of guessing from a dashboard screenshot.
 ## Current Limits
 
 This release defines the target model, live health-check runner, Playwright flow
-map explorer, generated UI regression tests, and failure evidence contract. It
-does not yet generate API tests automatically.
+map explorer, generated UI regression tests, generated OpenAPI/API request
+tests, and failure evidence contract.
 
 The next implementation pieces are:
 
-- OpenAPI/API scenario generation,
 - MCP run-fix-rerun tools,
 - retained product-test memory,
 - flake/setup/real-regression classification,

@@ -8,11 +8,14 @@
     "schemaVersion",
     "generatedAt",
     "target",
-    "sourceFlowMapPath",
     "testSourcePath",
     "reviewRequired",
     "promoteByCopyingTo",
     "tests"
+  ],
+  "anyOf": [
+    { "required": ["sourceFlowMapPath"] },
+    { "required": ["sourceOpenApiSchemaPath"] }
   ],
   "properties": {
     "schemaVersion": {
@@ -32,6 +35,10 @@
       }
     },
     "sourceFlowMapPath": {
+      "type": "string",
+      "minLength": 1
+    },
+    "sourceOpenApiSchemaPath": {
       "type": "string",
       "minLength": 1
     },
@@ -56,11 +63,26 @@
           "id": { "type": "string", "minLength": 1 },
           "title": { "type": "string", "minLength": 1 },
           "kind": {
-            "enum": ["route-load", "link-navigation", "input-state", "form-visibility"]
+            "enum": ["route-load", "link-navigation", "input-state", "form-visibility", "api-operation"]
           },
           "pageUrl": { "type": "string", "format": "uri" },
           "selector": { "type": "string" },
           "targetUrl": { "type": "string", "format": "uri" },
+          "method": {
+            "enum": ["GET", "HEAD", "OPTIONS", "POST", "PUT", "PATCH", "DELETE"]
+          },
+          "operationPath": { "type": "string", "minLength": 1 },
+          "operationId": { "type": "string", "minLength": 1 },
+          "expectedStatuses": {
+            "type": "array",
+            "items": {
+              "type": "integer",
+              "minimum": 100,
+              "maximum": 599
+            }
+          },
+          "requestBody": true,
+          "destructive": { "type": "boolean" },
           "priority": {
             "enum": ["high", "medium", "low"]
           }

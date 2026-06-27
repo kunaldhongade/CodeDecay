@@ -1,7 +1,7 @@
 import { spawn, spawnSync, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
-import { dirname, join, resolve } from "node:path";
+import { dirname, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   createConfiguredCommandAdapters,
@@ -46,6 +46,7 @@ import { renderReport, type ReportFormat } from "@submuxhq/codedecay-report";
 import { loadCodeDecaySkills } from "@submuxhq/codedecay-skills";
 import { createTestProofAudit } from "@submuxhq/codedecay-test-audit";
 import { createConfiguredToolHarnesses, type ConfiguredToolAdapterKind } from "@submuxhq/codedecay-tool-adapters";
+import YAML from "yaml";
 
 interface AnalyzeOptions {
   base?: string | undefined;
@@ -126,6 +127,8 @@ interface ProductOptions {
   explore: boolean;
   generateTests: boolean;
   runGeneratedTests: boolean;
+  generateApiTests: boolean;
+  runGeneratedApiTests: boolean;
   maxPages: number;
   maxActions: number;
   allowDestructiveActions: boolean;
@@ -232,6 +235,8 @@ interface ProductTargetResult {
   exploration?: ProductExplorationResult | undefined;
   generatedTests?: ProductGeneratedTestsResult | undefined;
   generatedTestRun?: ProductGeneratedTestRunResult | undefined;
+  generatedApiTests?: ProductGeneratedTestsResult | undefined;
+  generatedApiTestRun?: ProductGeneratedTestRunResult | undefined;
   teardown?: CommandExecutionResult | undefined;
   notes: string[];
 }
@@ -286,10 +291,16 @@ interface ProductGeneratedTestsResult {
 interface ProductGeneratedTestCase {
   id: string;
   title: string;
-  kind: "route-load" | "link-navigation" | "input-state" | "form-visibility";
+  kind: "route-load" | "link-navigation" | "input-state" | "form-visibility" | "api-operation";
   pageUrl: string;
   selector?: string | undefined;
   targetUrl?: string | undefined;
+  method?: string | undefined;
+  operationPath?: string | undefined;
+  operationId?: string | undefined;
+  expectedStatuses?: number[] | undefined;
+  requestBody?: unknown;
+  destructive?: boolean | undefined;
   priority: "high" | "medium" | "low";
 }
 
@@ -300,7 +311,8 @@ interface ProductGeneratedTestManifest {
     id: string;
     baseUrl: string;
   };
-  sourceFlowMapPath: string;
+  sourceFlowMapPath?: string | undefined;
+  sourceOpenApiSchemaPath?: string | undefined;
   testSourcePath: string;
   reviewRequired: true;
   promoteByCopyingTo: string;
@@ -327,9 +339,18 @@ interface ProductGeneratedTestFailure {
   title: string;
   failingStep: string;
   error: string;
+  request?: ProductGeneratedTestFailureRequest | undefined;
+  expected?: string | undefined;
+  actual?: string | undefined;
+  impactedFiles?: string[] | undefined;
   testSourcePath: string;
   testSource: string;
   rerunCommand: string;
+}
+
+interface ProductGeneratedTestFailureRequest {
+  method: string;
+  url: string;
 }
 
 interface ProductExplorerOptions {
@@ -842,6 +863,8 @@ const HELP_DOCS: Record<string, CommandDoc> = {
       { flag: "--explore", description: "Use a project-provided Playwright install to crawl same-origin product flows" },
       { flag: "--generate-tests", description: "Generate reviewable Playwright regression tests from the target flow map" },
       { flag: "--run-generated-tests", description: "Run generated Playwright tests through the target repo's local Playwright CLI" },
+      { flag: "--generate-api-tests", description: "Generate reviewable API regression tests from a configured OpenAPI schema" },
+      { flag: "--run-generated-api-tests", description: "Run generated API tests through the target repo's local Playwright CLI" },
       { flag: "--max-pages <count>", description: "Maximum pages to visit during --explore (default: 10)" },
       { flag: "--max-actions <count>", description: "Maximum interactive elements to record during --explore (default: 50)" },
       { flag: "--allow-destructive-actions", description: "Record destructive forms/actions as allowed instead of blocked" },
@@ -852,13 +875,14 @@ const HELP_DOCS: Record<string, CommandDoc> = {
       "codedecay product --format markdown",
       "codedecay product --target web --format json",
       "codedecay product --target web --explore --max-pages 5 --format markdown",
-      "codedecay product --target web --generate-tests --run-generated-tests --format markdown"
+      "codedecay product --target web --generate-tests --run-generated-tests --format markdown",
+      "codedecay product --target api --generate-api-tests --run-generated-api-tests --format markdown"
     ],
     notes: [
       "Product target commands run only when they are configured and `safety.allowCommands` is true.",
       "Existing `baseUrl` and preview URL targets are checked without starting commands.",
       "`--explore` is an explicit execution workflow and requires `safety.allowCommands: true` plus a project-provided Playwright install.",
-      "Generated tests are written under `.codedecay/local/generated-tests/` for review; CodeDecay never commits or promotes them automatically."
+      "Generated tests are written under `.codedecay/local/generated-tests/` and `.codedecay/local/generated-api-tests/` for review; CodeDecay never commits or promotes them automatically."
     ]
   },
   mcp: {
@@ -2082,6 +2106,8 @@ function parseProductArgs(args: string[]): ProductOptions {
     explore: false,
     generateTests: false,
     runGeneratedTests: false,
+    generateApiTests: false,
+    runGeneratedApiTests: false,
     maxPages: 10,
     maxActions: 50,
     allowDestructiveActions: false
@@ -2132,6 +2158,16 @@ function parseProductArgs(args: string[]): ProductOptions {
 
     if (arg === "--run-generated-tests") {
       options.runGeneratedTests = true;
+      continue;
+    }
+
+    if (arg === "--generate-api-tests") {
+      options.generateApiTests = true;
+      continue;
+    }
+
+    if (arg === "--run-generated-api-tests") {
+      options.runGeneratedApiTests = true;
       continue;
     }
 
@@ -3423,8 +3459,8 @@ async function createProductTargetReport(
   const startedAt = Date.now();
   const allTargets = Object.values(loadedConfig.config.productTesting.targets).sort((left, right) => left.id.localeCompare(right.id));
   const targets = selectProductTargets(allTargets, options.target);
-  if (options.explore && targets.length === 0) {
-    throw new Error("codedecay product --explore requires at least one configured productTesting target.");
+  if ((options.explore || options.generateTests || options.runGeneratedTests || options.generateApiTests || options.runGeneratedApiTests) && targets.length === 0) {
+    throw new Error("codedecay product execution workflows require at least one configured productTesting target.");
   }
 
   const results: ProductTargetResult[] = [];
@@ -3442,7 +3478,7 @@ async function createProductTargetReport(
     safety: {
       commandsExecuted: results.some((result) => commandActuallyExecuted(result.setup) || commandActuallyExecuted(result.teardown) || result.start?.status === "started"),
       browserAutomationRan: results.some((result) => result.exploration?.status === "passed" || result.exploration?.status === "failed"),
-      generatedTestsRan: results.some((result) => result.generatedTestRun !== undefined),
+      generatedTestsRan: results.some((result) => result.generatedTestRun !== undefined || result.generatedApiTestRun !== undefined),
       startupCommandsAllowed: loadedConfig.config.safety.allowCommands,
       telemetrySent: false,
       cloudDependency: false,
@@ -3451,7 +3487,7 @@ async function createProductTargetReport(
         "CodeDecay only runs configured product target commands when safety.allowCommands is true.",
         "Existing baseUrl and preview URL targets can be health-checked without startup commands.",
         "Product exploration uses a project-provided Playwright install and never installs browsers.",
-        "Generated tests are review artifacts unless --run-generated-tests is explicitly used."
+        "Generated tests are review artifacts unless --run-generated-tests or --run-generated-api-tests is explicitly used."
       ]
     }
   };
@@ -3491,6 +3527,8 @@ async function runProductTarget(
   let exploration: ProductExplorationResult | undefined;
   let generatedTests: ProductGeneratedTestsResult | undefined;
   let generatedTestRun: ProductGeneratedTestRunResult | undefined;
+  let generatedApiTests: ProductGeneratedTestsResult | undefined;
+  let generatedApiTestRun: ProductGeneratedTestRunResult | undefined;
   let teardown: CommandExecutionResult | undefined;
   let status: ProductTargetStatus = "skipped";
   let shouldRunHealthCheck = true;
@@ -3559,9 +3597,23 @@ async function runProductTarget(
       if (generatedTests.status !== "passed") {
         status = generatedTests.status;
       } else if (options.runGeneratedTests) {
-        generatedTestRun = await runGeneratedProductTests(rootDir, loadedConfig, target, generatedTests);
+        generatedTestRun = await runGeneratedProductTests(rootDir, loadedConfig, target, generatedTests, "--run-generated-tests");
         if (generatedTestRun.status !== "passed") {
           status = generatedTestRun.status;
+        }
+      }
+    }
+
+    if (options.generateApiTests || options.runGeneratedApiTests) {
+      generatedApiTests = options.generateApiTests
+        ? generateProductApiTestsForTarget(rootDir, loadedConfig, target, health, options.allowDestructiveActions)
+        : loadGeneratedProductApiTestsForTarget(rootDir, target);
+      if (generatedApiTests.status !== "passed") {
+        status = generatedApiTests.status;
+      } else if (options.runGeneratedApiTests) {
+        generatedApiTestRun = await runGeneratedProductTests(rootDir, loadedConfig, target, generatedApiTests, "--run-generated-api-tests");
+        if (generatedApiTestRun.status !== "passed") {
+          status = generatedApiTestRun.status;
         }
       }
     }
@@ -3579,7 +3631,21 @@ async function runProductTarget(
     }
   }
 
-  return createProductTargetResult(target, status, startedAt, notes, setup, startResult, health, exploration, generatedTests, generatedTestRun, teardown);
+  return createProductTargetResult(
+    target,
+    status,
+    startedAt,
+    notes,
+    setup,
+    startResult,
+    health,
+    exploration,
+    generatedTests,
+    generatedTestRun,
+    generatedApiTests,
+    generatedApiTestRun,
+    teardown
+  );
 }
 
 function createProductTargetResult(
@@ -3593,6 +3659,8 @@ function createProductTargetResult(
   exploration: ProductExplorationResult | undefined,
   generatedTests: ProductGeneratedTestsResult | undefined,
   generatedTestRun: ProductGeneratedTestRunResult | undefined,
+  generatedApiTests: ProductGeneratedTestsResult | undefined,
+  generatedApiTestRun: ProductGeneratedTestRunResult | undefined,
   teardown: CommandExecutionResult | undefined
 ): ProductTargetResult {
   const result: ProductTargetResult = {
@@ -3629,6 +3697,14 @@ function createProductTargetResult(
 
   if (generatedTestRun) {
     result.generatedTestRun = generatedTestRun;
+  }
+
+  if (generatedApiTests) {
+    result.generatedApiTests = generatedApiTests;
+  }
+
+  if (generatedApiTestRun) {
+    result.generatedApiTestRun = generatedApiTestRun;
   }
 
   if (teardown) {
@@ -4533,11 +4609,583 @@ function loadGeneratedProductTestsForTarget(rootDir: string, target: CodeDecayPr
   }
 }
 
+type ProductHttpMethod = "GET" | "HEAD" | "OPTIONS" | "POST" | "PUT" | "PATCH" | "DELETE";
+
+interface OpenApiDocument {
+  openapi?: string | undefined;
+  swagger?: string | undefined;
+  servers?: Array<{ url?: string | undefined }> | undefined;
+  paths?: Record<string, OpenApiPathItem | undefined> | undefined;
+}
+
+interface OpenApiPathItem {
+  parameters?: OpenApiParameter[] | undefined;
+  get?: OpenApiOperation | undefined;
+  head?: OpenApiOperation | undefined;
+  options?: OpenApiOperation | undefined;
+  post?: OpenApiOperation | undefined;
+  put?: OpenApiOperation | undefined;
+  patch?: OpenApiOperation | undefined;
+  delete?: OpenApiOperation | undefined;
+}
+
+interface OpenApiOperation {
+  operationId?: string | undefined;
+  summary?: string | undefined;
+  description?: string | undefined;
+  parameters?: OpenApiParameter[] | undefined;
+  requestBody?: OpenApiRequestBody | undefined;
+  responses?: Record<string, unknown> | undefined;
+}
+
+interface OpenApiParameter {
+  name?: string | undefined;
+  in?: string | undefined;
+  required?: boolean | undefined;
+  schema?: OpenApiSchema | undefined;
+  example?: unknown;
+}
+
+interface OpenApiRequestBody {
+  content?: Record<string, { schema?: OpenApiSchema | undefined; example?: unknown } | undefined> | undefined;
+  required?: boolean | undefined;
+}
+
+interface OpenApiSchema {
+  type?: string | undefined;
+  format?: string | undefined;
+  enum?: unknown[] | undefined;
+  default?: unknown;
+  example?: unknown;
+  properties?: Record<string, OpenApiSchema | undefined> | undefined;
+  required?: string[] | undefined;
+  items?: OpenApiSchema | undefined;
+}
+
+interface ResolvedOpenApiSchema {
+  schemaPath: string;
+  absolutePath: string;
+  source: "configured" | "discovered";
+}
+
+const PRODUCT_API_METHODS: ProductHttpMethod[] = ["GET", "HEAD", "OPTIONS", "POST", "PUT", "PATCH", "DELETE"];
+const SAFE_PRODUCT_API_METHODS = new Set<ProductHttpMethod>(["GET", "HEAD", "OPTIONS"]);
+
+function generateProductApiTestsForTarget(
+  rootDir: string,
+  loadedConfig: LoadedCodeDecayConfig,
+  target: CodeDecayProductTarget,
+  health: ProductHealthResult | undefined,
+  allowDestructiveActions: boolean
+): ProductGeneratedTestsResult {
+  const startedAt = Date.now();
+  const notes = [
+    "Generated API tests are written for review and are never committed or promoted automatically.",
+    "OpenAPI request checks accept documented non-5xx statuses and fail unexpected server errors.",
+    "Mutating API methods are generated as skipped review cases unless --allow-destructive-actions is passed."
+  ];
+  const schema = resolveProductOpenApiSchema(rootDir, loadedConfig);
+  if (!schema.ok) {
+    return {
+      status: "blocked",
+      tests: [],
+      durationMs: elapsed(startedAt),
+      error: schema.error,
+      notes
+    };
+  }
+
+  let document: OpenApiDocument;
+  try {
+    document = YAML.parse(readFileSync(schema.schema.absolutePath, "utf8")) as OpenApiDocument;
+  } catch (error: unknown) {
+    const message = error instanceof Error ? error.message : String(error);
+    return {
+      status: "failed",
+      tests: [],
+      durationMs: elapsed(startedAt),
+      error: `Could not read OpenAPI schema ${schema.schema.schemaPath}: ${message}`,
+      notes
+    };
+  }
+
+  if (!document || typeof document !== "object" || !document.paths || typeof document.paths !== "object") {
+    return {
+      status: "blocked",
+      tests: [],
+      durationMs: elapsed(startedAt),
+      error: `OpenAPI schema ${schema.schema.schemaPath} does not contain a usable paths object.`,
+      notes
+    };
+  }
+
+  const baseUrl = resolveProductApiBaseUrl(loadedConfig, target, health, document);
+  if (!baseUrl) {
+    return {
+      status: "blocked",
+      tests: [],
+      durationMs: elapsed(startedAt),
+      error: "API test generation requires productTesting.targets.<id>.baseUrl, previewUrlEnv, toolAdapters.schemathesis.baseUrl, healthCheck, or an absolute OpenAPI servers[0].url.",
+      notes
+    };
+  }
+
+  const impactedPaths = findImpactedProductPaths(rootDir);
+  const tests = createGeneratedProductApiTestCases(document, baseUrl, impactedPaths);
+  if (tests.length === 0) {
+    return {
+      status: "blocked",
+      tests: [],
+      durationMs: elapsed(startedAt),
+      error: `OpenAPI schema ${schema.schema.schemaPath} did not contain supported HTTP operations.`,
+      notes
+    };
+  }
+
+  const testSourcePath = join(".codedecay", "local", "generated-api-tests", sanitizeArtifactSegment(target.id), "api.generated.spec.ts");
+  const manifestPath = join(".codedecay", "local", "generated-api-tests", sanitizeArtifactSegment(target.id), "manifest.json");
+  const source = renderGeneratedProductApiTestSource(target.id, baseUrl, schema.schema.schemaPath, tests, allowDestructiveActions);
+  const manifest: ProductGeneratedTestManifest = {
+    schemaVersion: 1,
+    generatedAt: new Date().toISOString(),
+    target: {
+      id: target.id,
+      baseUrl
+    },
+    sourceOpenApiSchemaPath: schema.schema.schemaPath,
+    testSourcePath,
+    reviewRequired: true,
+    promoteByCopyingTo: "tests/api/codedecay-api.spec.ts",
+    tests
+  };
+
+  writeOutput(rootDir, testSourcePath, source);
+  writeOutput(rootDir, manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+
+  return {
+    status: "passed",
+    sourcePath: testSourcePath,
+    manifestPath,
+    tests,
+    durationMs: elapsed(startedAt),
+    notes: [...notes, `OpenAPI schema: ${schema.schema.schemaPath} (${schema.schema.source}).`]
+  };
+}
+
+function loadGeneratedProductApiTestsForTarget(rootDir: string, target: CodeDecayProductTarget): ProductGeneratedTestsResult {
+  const startedAt = Date.now();
+  const manifestPath = defaultProductGeneratedApiTestManifestPath(target.id);
+  const notes = [
+    "Loaded existing generated API tests without regenerating source.",
+    "Review edits are preserved when using --run-generated-api-tests without --generate-api-tests."
+  ];
+
+  if (!existsSync(join(rootDir, manifestPath))) {
+    return {
+      status: "blocked",
+      tests: [],
+      durationMs: elapsed(startedAt),
+      error: `Generated API test manifest not found at ${manifestPath}. Run codedecay product --target ${target.id} --generate-api-tests first.`,
+      notes
+    };
+  }
+
+  try {
+    const manifest = JSON.parse(readFileSync(join(rootDir, manifestPath), "utf8")) as ProductGeneratedTestManifest;
+    if (!manifest.testSourcePath || !existsSync(join(rootDir, manifest.testSourcePath))) {
+      return {
+        status: "blocked",
+        manifestPath,
+        tests: manifest.tests ?? [],
+        durationMs: elapsed(startedAt),
+        error: `Generated API test source not found at ${manifest.testSourcePath}. Run codedecay product --target ${target.id} --generate-api-tests first.`,
+        notes
+      };
+    }
+
+    return {
+      status: "passed",
+      sourcePath: manifest.testSourcePath,
+      manifestPath,
+      tests: manifest.tests ?? [],
+      durationMs: elapsed(startedAt),
+      notes
+    };
+  } catch (error: unknown) {
+    const message = error instanceof Error ? error.message : String(error);
+    return {
+      status: "failed",
+      manifestPath,
+      tests: [],
+      durationMs: elapsed(startedAt),
+      error: `Could not read generated API test manifest ${manifestPath}: ${message}`,
+      notes
+    };
+  }
+}
+
+function resolveProductOpenApiSchema(
+  rootDir: string,
+  loadedConfig: LoadedCodeDecayConfig
+): { ok: true; schema: ResolvedOpenApiSchema } | { ok: false; error: string } {
+  const configured = loadedConfig.config.toolAdapters.schemathesis?.schema;
+  if (configured) {
+    if (/^https?:\/\//i.test(configured)) {
+      return {
+        ok: false,
+        error: "HTTP(S) OpenAPI schema URLs are not fetched by codedecay product yet. Provide a local toolAdapters.schemathesis.schema file for local-first generation."
+      };
+    }
+
+    const absolutePath = resolve(rootDir, configured);
+    if (!existsSync(absolutePath)) {
+      return {
+        ok: false,
+        error: `Configured OpenAPI schema not found at ${configured}.`
+      };
+    }
+
+    return {
+      ok: true,
+      schema: {
+        schemaPath: relativePathForArtifact(rootDir, absolutePath),
+        absolutePath,
+        source: "configured"
+      }
+    };
+  }
+
+  for (const candidate of [
+    "openapi.yaml",
+    "openapi.yml",
+    "openapi.json",
+    "docs/openapi.yaml",
+    "docs/openapi.yml",
+    "docs/openapi.json",
+    "api/openapi.yaml",
+    "api/openapi.yml",
+    "api/openapi.json"
+  ]) {
+    const absolutePath = resolve(rootDir, candidate);
+    if (existsSync(absolutePath)) {
+      return {
+        ok: true,
+        schema: {
+          schemaPath: candidate,
+          absolutePath,
+          source: "discovered"
+        }
+      };
+    }
+  }
+
+  return {
+    ok: false,
+    error: "No OpenAPI schema found. Set toolAdapters.schemathesis.schema or add openapi.yaml, openapi.json, docs/openapi.yaml, or api/openapi.yaml."
+  };
+}
+
+function resolveProductApiBaseUrl(
+  loadedConfig: LoadedCodeDecayConfig,
+  target: CodeDecayProductTarget,
+  health: ProductHealthResult | undefined,
+  document: OpenApiDocument
+): string | undefined {
+  const configured = target.readiness.effectiveBaseUrl ?? target.baseUrl ?? loadedConfig.config.toolAdapters.schemathesis?.baseUrl;
+  if (configured) {
+    return normalizeExploreUrl(configured);
+  }
+
+  if (health?.url) {
+    const resolved = resolveMaybeUrl(health.url, health.url);
+    if (resolved) {
+      return new URL(resolved).origin;
+    }
+  }
+
+  const serverUrl = document.servers?.find((server) => typeof server.url === "string" && /^https?:\/\//i.test(server.url))?.url;
+  return serverUrl ? normalizeExploreUrl(serverUrl) : undefined;
+}
+
+function createGeneratedProductApiTestCases(
+  document: OpenApiDocument,
+  baseUrl: string,
+  impactedPaths: Set<string>
+): ProductGeneratedTestCase[] {
+  const tests: ProductGeneratedTestCase[] = [];
+  const seen = new Set<string>();
+  const paths = document.paths ?? {};
+
+  for (const path of Object.keys(paths).sort((left, right) => left.localeCompare(right))) {
+    const pathItem = paths[path];
+    if (!pathItem || typeof pathItem !== "object") {
+      continue;
+    }
+
+    for (const method of PRODUCT_API_METHODS) {
+      const operation = pathItem[method.toLowerCase() as Lowercase<ProductHttpMethod>];
+      if (!operation || typeof operation !== "object") {
+        continue;
+      }
+
+      const operationPath = sampleOpenApiOperationPath(path, pathItem, operation);
+      const expectedStatuses = openApiExpectedStatuses(operation);
+      const destructive = !SAFE_PRODUCT_API_METHODS.has(method);
+      const id = generatedTestId("api", method, path, operation.operationId ?? "");
+      addGeneratedTestCase(tests, seen, {
+        id,
+        title: `${method} ${path} returns a documented status`,
+        kind: "api-operation",
+        pageUrl: new URL(operationPath, baseUrl.endsWith("/") ? baseUrl : `${baseUrl}/`).toString(),
+        method,
+        operationPath,
+        operationId: operation.operationId,
+        expectedStatuses,
+        requestBody: destructive ? sampleOpenApiRequestBody(operation) : undefined,
+        destructive,
+        priority: priorityForPath(path, impactedPaths)
+      });
+    }
+  }
+
+  return tests.sort((left, right) => priorityRank(left.priority) - priorityRank(right.priority) || left.id.localeCompare(right.id));
+}
+
+function renderGeneratedProductApiTestSource(
+  targetId: string,
+  baseUrl: string,
+  sourceSchemaPath: string,
+  tests: ProductGeneratedTestCase[],
+  allowDestructiveActions: boolean
+): string {
+  const lines = [
+    "import { test } from '@playwright/test';",
+    "",
+    "// @generated by CodeDecay. Review before promoting into your permanent test suite.",
+    `// codedecay:source-openapi-schema=${sourceSchemaPath}`,
+    `// codedecay:target=${targetId}`,
+    "",
+    `const CODEDECAY_API_BASE_URL = process.env.CODEDECAY_PRODUCT_BASE_URL ?? ${JSON.stringify(baseUrl)};`,
+    "",
+    "function apiUrl(path: string): string {",
+    "  return new URL(path, CODEDECAY_API_BASE_URL.endsWith('/') ? CODEDECAY_API_BASE_URL : `${CODEDECAY_API_BASE_URL}/`).toString();",
+    "}",
+    "",
+    "async function responseSnippet(response: { text: () => Promise<string> }): Promise<string> {",
+    "  try {",
+    "    return (await response.text()).replace(/\\s+/g, ' ').trim().slice(0, 500);",
+    "  } catch {",
+    "    return '';",
+    "  }",
+    "}",
+    "",
+    `test.describe(${JSON.stringify(`CodeDecay generated API regression tests (${targetId})`)}, () => {`
+  ];
+
+  for (const testCase of tests) {
+    const declaration = testCase.destructive && !allowDestructiveActions ? "test.skip" : "test";
+    lines.push(
+      "",
+      `  ${declaration}(${JSON.stringify(testCase.title)}, async ({ request }) => {`,
+      `    test.info().annotations.push({ type: 'codedecay.testId', description: ${JSON.stringify(testCase.id)} });`
+    );
+    appendGeneratedApiTestBody(lines, testCase);
+    lines.push("  });");
+  }
+
+  lines.push("});", "");
+  return lines.join("\n");
+}
+
+function appendGeneratedApiTestBody(lines: string[], testCase: ProductGeneratedTestCase): void {
+  const method = testCase.method ?? "GET";
+  const operationPath = testCase.operationPath ?? new URL(testCase.pageUrl).pathname;
+  const expectedStatuses = testCase.expectedStatuses ?? [];
+  const requestBody = testCase.requestBody;
+  const headers = requestBody === undefined ? { accept: "application/json" } : { accept: "application/json", "content-type": "application/json" };
+  lines.push("    const response = await request.fetch(");
+  lines.push(`      apiUrl(${JSON.stringify(operationPath)}),`);
+  lines.push("      {");
+  lines.push(`        method: ${JSON.stringify(method)},`);
+  lines.push(`        headers: ${JSON.stringify(headers)}${requestBody === undefined ? "" : ","}`);
+  if (requestBody !== undefined) {
+    lines.push(`        data: ${JSON.stringify(requestBody, null, 10).replace(/\n/g, "\n        ")}`);
+  }
+  lines.push("      }");
+  lines.push("    );");
+  lines.push("    const status = response.status();");
+  if (expectedStatuses.length > 0) {
+    lines.push(`    const expectedStatuses = ${JSON.stringify(expectedStatuses)};`);
+    lines.push("    if (!expectedStatuses.includes(status)) {");
+    lines.push("      throw new Error(`Expected documented status ${expectedStatuses.join(', ')} but got ${status}. Body: ${await responseSnippet(response)}`);");
+    lines.push("    }");
+  } else {
+    lines.push("    if (status >= 500) {");
+    lines.push("      throw new Error(`Expected a non-5xx API response but got ${status}. Body: ${await responseSnippet(response)}`);");
+    lines.push("    }");
+  }
+}
+
+function sampleOpenApiRequestBody(operation: OpenApiOperation): unknown {
+  const content = operation.requestBody?.content;
+  const jsonMedia = content?.["application/json"] ?? content?.["application/problem+json"] ?? Object.values(content ?? {}).find(Boolean);
+  if (!jsonMedia) {
+    return {
+      codedecay: "review-before-running"
+    };
+  }
+
+  if (jsonMedia.example !== undefined) {
+    return jsonMedia.example;
+  }
+
+  return sampleOpenApiSchemaValue(jsonMedia.schema);
+}
+
+function sampleOpenApiSchemaValue(schema: OpenApiSchema | undefined): unknown {
+  if (!schema) {
+    return {
+      codedecay: "review-before-running"
+    };
+  }
+
+  if (schema.example !== undefined) {
+    return schema.example;
+  }
+
+  if (schema.default !== undefined) {
+    return schema.default;
+  }
+
+  if (Array.isArray(schema.enum) && schema.enum.length > 0) {
+    return schema.enum[0];
+  }
+
+  if (schema.type === "array") {
+    return [sampleOpenApiSchemaValue(schema.items)];
+  }
+
+  if (schema.type === "integer" || schema.type === "number") {
+    return 1;
+  }
+
+  if (schema.type === "boolean") {
+    return true;
+  }
+
+  if (schema.type === "string") {
+    if (schema.format === "email") {
+      return "codedecay@example.com";
+    }
+
+    if (schema.format === "uri" || schema.format === "url") {
+      return "https://example.com";
+    }
+
+    if (schema.format === "uuid") {
+      return "00000000-0000-4000-8000-000000000001";
+    }
+
+    return "codedecay";
+  }
+
+  const properties = schema.properties ?? {};
+  const required = new Set(schema.required ?? Object.keys(properties));
+  const value: Record<string, unknown> = {};
+  for (const [name, property] of Object.entries(properties)) {
+    if (!required.has(name)) {
+      continue;
+    }
+
+    value[name] = sampleOpenApiSchemaValue(property);
+  }
+
+  return Object.keys(value).length > 0 ? value : { codedecay: "review-before-running" };
+}
+
+function sampleOpenApiOperationPath(path: string, pathItem: OpenApiPathItem, operation: OpenApiOperation): string {
+  const parameters = [...(pathItem.parameters ?? []), ...(operation.parameters ?? [])];
+  const replacedPath = path.replace(/\{([^}]+)\}/g, (_match, name: string) => encodeURIComponent(String(sampleOpenApiParameterValue(name, parameters))));
+  const query = new URLSearchParams();
+
+  for (const parameter of parameters) {
+    if (parameter.in !== "query" || !parameter.name || parameter.required !== true) {
+      continue;
+    }
+
+    query.set(parameter.name, String(sampleOpenApiParameterValue(parameter.name, parameters)));
+  }
+
+  const queryString = query.toString();
+  return queryString ? `${replacedPath}?${queryString}` : replacedPath;
+}
+
+function sampleOpenApiParameterValue(name: string, parameters: OpenApiParameter[]): string | number | boolean {
+  const parameter = parameters.find((candidate) => candidate.name === name);
+  const schema = parameter?.schema;
+  const lowerName = name.toLowerCase();
+
+  if (parameter?.example !== undefined) {
+    return primitiveSampleValue(parameter.example);
+  }
+
+  if (schema?.example !== undefined) {
+    return primitiveSampleValue(schema.example);
+  }
+
+  if (schema?.default !== undefined) {
+    return primitiveSampleValue(schema.default);
+  }
+
+  if (Array.isArray(schema?.enum) && schema.enum.length > 0) {
+    return primitiveSampleValue(schema.enum[0]);
+  }
+
+  if (schema?.type === "integer" || schema?.type === "number" || /\b(id|count|page|limit|offset)\b/i.test(lowerName)) {
+    return 1;
+  }
+
+  if (schema?.type === "boolean") {
+    return true;
+  }
+
+  if (schema?.format === "email" || lowerName.includes("email")) {
+    return "codedecay@example.com";
+  }
+
+  if (schema?.format === "uuid" || lowerName.includes("uuid")) {
+    return "00000000-0000-4000-8000-000000000001";
+  }
+
+  return "codedecay";
+}
+
+function primitiveSampleValue(value: unknown): string | number | boolean {
+  if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") {
+    return value;
+  }
+
+  if (value === null || value === undefined) {
+    return "codedecay";
+  }
+
+  return JSON.stringify(value);
+}
+
+function openApiExpectedStatuses(operation: OpenApiOperation): number[] {
+  return Object.keys(operation.responses ?? {})
+    .filter((status) => /^\d{3}$/.test(status))
+    .map((status) => Number(status))
+    .filter((status) => status >= 100 && status < 500)
+    .sort((left, right) => left - right);
+}
+
 async function runGeneratedProductTests(
   rootDir: string,
   loadedConfig: LoadedCodeDecayConfig,
   target: CodeDecayProductTarget,
-  generatedTests: ProductGeneratedTestsResult
+  generatedTests: ProductGeneratedTestsResult,
+  rerunFlag: "--run-generated-tests" | "--run-generated-api-tests"
 ): Promise<ProductGeneratedTestRunResult> {
   const startedAt = Date.now();
   const notes = [
@@ -4607,7 +5255,9 @@ async function runGeneratedProductTests(
     stdout: execution.stdout,
     generatedTests,
     testSource,
-    target
+    target,
+    rootDir,
+    rerunFlag
   });
   const failed = parsed.failed > 0 || execution.status !== "passed";
   const fallbackFailures =
@@ -4619,7 +5269,9 @@ async function runGeneratedProductTests(
             error: execution.error ?? (execution.stderr.trim() || `Playwright command exited with status ${execution.status}.`),
             generatedTests,
             testSource,
-            target
+            target,
+            rootDir,
+            rerunFlag
           })
         ]
       : parsed.failures;
@@ -4838,6 +5490,8 @@ function parsePlaywrightTestRun(input: {
   generatedTests: ProductGeneratedTestsResult;
   testSource: string;
   target: CodeDecayProductTarget;
+  rootDir: string;
+  rerunFlag: "--run-generated-tests" | "--run-generated-api-tests";
 }): { passed: number; failed: number; skipped: number; failures: ProductGeneratedTestFailure[] } {
   const parsed = parseJsonFromOutput(input.stdout);
   if (!parsed || typeof parsed !== "object") {
@@ -4884,7 +5538,9 @@ function parsePlaywrightTestRun(input: {
           error: extractPlaywrightError(firstFailedResult) ?? extractPlaywrightError(spec) ?? "Generated Playwright test failed.",
           generatedTests: input.generatedTests,
           testSource: input.testSource,
-          target: input.target
+          target: input.target,
+          rootDir: input.rootDir,
+          rerunFlag: input.rerunFlag
         })
       );
     } else if (hasSkip) {
@@ -4935,15 +5591,32 @@ function createGeneratedTestFailure(input: {
   generatedTests: ProductGeneratedTestsResult;
   testSource: string;
   target: CodeDecayProductTarget;
+  rootDir: string;
+  rerunFlag: "--run-generated-tests" | "--run-generated-api-tests";
 }): ProductGeneratedTestFailure {
+  const testCase =
+    input.testId !== undefined
+      ? input.generatedTests.tests.find((candidate) => candidate.id === input.testId)
+      : input.generatedTests.tests.find((candidate) => candidate.title === input.title || input.title.includes(candidate.title));
+  const impactedFiles = findImpactedProductFiles(input.rootDir);
   return {
     testId: input.testId,
     title: input.title,
     failingStep: input.failingStep,
     error: input.error,
+    request:
+      testCase?.method && testCase.operationPath
+        ? {
+            method: testCase.method,
+            url: testCase.pageUrl
+          }
+        : undefined,
+    expected: expectedGeneratedTestBehavior(testCase),
+    actual: input.error,
+    impactedFiles: impactedFiles.length > 0 ? impactedFiles : undefined,
     testSourcePath: input.generatedTests.sourcePath ?? "",
     testSource: input.testSource,
-    rerunCommand: `npx codedecay product --target ${input.target.id} --run-generated-tests --format markdown`
+    rerunCommand: `npx codedecay product --target ${input.target.id} ${input.rerunFlag} --format markdown`
   };
 }
 
@@ -5011,6 +5684,10 @@ function defaultProductGeneratedTestManifestPath(targetId: string): string {
   return join(".codedecay", "local", "generated-tests", sanitizeArtifactSegment(targetId), "manifest.json");
 }
 
+function defaultProductGeneratedApiTestManifestPath(targetId: string): string {
+  return join(".codedecay", "local", "generated-api-tests", sanitizeArtifactSegment(targetId), "manifest.json");
+}
+
 function findImpactedProductPaths(rootDir: string): Set<string> {
   try {
     const repoRoot = getRepoRoot(rootDir);
@@ -5019,6 +5696,36 @@ function findImpactedProductPaths(rootDir: string): Set<string> {
   } catch {
     return new Set();
   }
+}
+
+function findImpactedProductFiles(rootDir: string): string[] {
+  try {
+    const repoRoot = getRepoRoot(rootDir);
+    return getChangedFilesForCli(repoRoot, { format: "markdown" }).map((change) => change.path).sort((left, right) => left.localeCompare(right));
+  } catch {
+    return [];
+  }
+}
+
+function expectedGeneratedTestBehavior(testCase: ProductGeneratedTestCase | undefined): string | undefined {
+  if (!testCase) {
+    return undefined;
+  }
+
+  if (testCase.kind === "api-operation") {
+    const statusText =
+      testCase.expectedStatuses && testCase.expectedStatuses.length > 0
+        ? `one of the documented statuses ${testCase.expectedStatuses.join(", ")}`
+        : "a non-5xx response";
+    return `${testCase.method ?? "GET"} ${testCase.operationPath ?? testCase.pageUrl} should return ${statusText}.`;
+  }
+
+  return `${testCase.title} should pass in the generated product regression suite.`;
+}
+
+function relativePathForArtifact(rootDir: string, absolutePath: string): string {
+  const artifactPath = relative(rootDir, absolutePath);
+  return artifactPath && !artifactPath.startsWith("..") ? artifactPath : absolutePath;
 }
 
 function priorityForPath(path: string, impactedPaths: Set<string>): ProductGeneratedTestCase["priority"] {
@@ -5271,12 +5978,78 @@ function renderProductTargetMarkdown(report: ProductTargetReport): string {
         lines.push(`  - Failure: ${failure.title}`);
         lines.push(`  - Failing step: ${failure.failingStep}`);
         lines.push(`  - Error: ${failure.error}`);
+        if (failure.request) {
+          lines.push(`  - Request: ${failure.request.method} \`${failure.request.url}\``);
+        }
+        if (failure.expected) {
+          lines.push(`  - Expected: ${failure.expected}`);
+        }
+        if (failure.actual) {
+          lines.push(`  - Actual: ${failure.actual}`);
+        }
+        if (failure.impactedFiles && failure.impactedFiles.length > 0) {
+          lines.push(`  - Impacted files: ${failure.impactedFiles.map((file) => `\`${file}\``).join(", ")}`);
+        }
         lines.push(`  - Rerun: \`${failure.rerunCommand}\``);
         lines.push(`  - Test source path: \`${failure.testSourcePath}\``);
         appendCodeBlock(lines, "ts", failure.testSource);
       }
       for (const note of target.generatedTestRun.notes) {
         lines.push(`  - Generated test run note: ${note}`);
+      }
+    }
+
+    if (target.generatedApiTests) {
+      lines.push(`  - Generated API tests: ${formatProductStatus(target.generatedApiTests.status)} (${target.generatedApiTests.tests.length} test(s))`);
+      if (target.generatedApiTests.sourcePath) {
+        lines.push(`  - Generated API test source: \`${target.generatedApiTests.sourcePath}\``);
+      }
+      if (target.generatedApiTests.manifestPath) {
+        lines.push(`  - Generated API test manifest: \`${target.generatedApiTests.manifestPath}\``);
+      }
+      if (target.generatedApiTests.error) {
+        lines.push(`  - Generated API test error: ${target.generatedApiTests.error}`);
+      }
+      for (const generatedTest of target.generatedApiTests.tests.slice(0, 8)) {
+        const method = generatedTest.method ? `${generatedTest.method} ` : "";
+        lines.push(`  - API test: ${generatedTest.priority} ${method}\`${generatedTest.operationPath ?? generatedTest.pageUrl}\` ${generatedTest.title}`);
+      }
+      for (const note of target.generatedApiTests.notes) {
+        lines.push(`  - Generated API test note: ${note}`);
+      }
+    }
+
+    if (target.generatedApiTestRun) {
+      lines.push(`  - Generated API test run: ${formatProductStatus(target.generatedApiTestRun.status)}`);
+      if (target.generatedApiTestRun.command) {
+        lines.push(`  - Generated API test command: \`${target.generatedApiTestRun.command}\``);
+      }
+      lines.push(`  - Generated API test results: ${target.generatedApiTestRun.passed} passed, ${target.generatedApiTestRun.failed} failed, ${target.generatedApiTestRun.skipped} skipped`);
+      if (target.generatedApiTestRun.error) {
+        lines.push(`  - Generated API test run error: ${target.generatedApiTestRun.error}`);
+      }
+      for (const failure of target.generatedApiTestRun.failures) {
+        lines.push(`  - API failure: ${failure.title}`);
+        lines.push(`  - Failing step: ${failure.failingStep}`);
+        lines.push(`  - Error: ${failure.error}`);
+        if (failure.request) {
+          lines.push(`  - Request: ${failure.request.method} \`${failure.request.url}\``);
+        }
+        if (failure.expected) {
+          lines.push(`  - Expected: ${failure.expected}`);
+        }
+        if (failure.actual) {
+          lines.push(`  - Actual: ${failure.actual}`);
+        }
+        if (failure.impactedFiles && failure.impactedFiles.length > 0) {
+          lines.push(`  - Impacted files: ${failure.impactedFiles.map((file) => `\`${file}\``).join(", ")}`);
+        }
+        lines.push(`  - Rerun: \`${failure.rerunCommand}\``);
+        lines.push(`  - Test source path: \`${failure.testSourcePath}\``);
+        appendCodeBlock(lines, "ts", failure.testSource);
+      }
+      for (const note of target.generatedApiTestRun.notes) {
+        lines.push(`  - Generated API test run note: ${note}`);
       }
     }
 
