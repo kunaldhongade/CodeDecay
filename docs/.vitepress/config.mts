@@ -64,6 +64,7 @@ export default defineConfig({
           { text: "Execution Probes", link: "/execution" },
           { text: "Differential Checks", link: "/differential" },
           { text: "Product Testing", link: "/product-testing" },
+          { text: "Product Dashboard", link: "/product-dashboard" },
           { text: "Test Audit", link: "/test-audit" },
           { text: "PR Safety Evals", link: "/evals/first-efficacy-report" },
           { text: "Tool Adapters", link: "/tool-adapters" },

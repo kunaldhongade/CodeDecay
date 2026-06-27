@@ -338,14 +338,24 @@ Agent task bundles include the same product failure bundles in machine-readable
 JSON and Markdown, so agents can fix and rerun a specific failed check instead
 of guessing from a dashboard screenshot.
 
+## Static Dashboard
+
+Use `codedecay dashboard` to build a static product verification dashboard from
+`.codedecay/local/product-runs/**/*.json` and
+`.codedecay/local/product-trends/**/*.json` artifacts. The generated dashboard
+includes run history, classification counts, flaky checks, confirmed
+regressions, and links to exact failure bundle JSON/Markdown files.
+
+See [Product Dashboard](product-dashboard.md).
+
 ## Current Limits
 
 This release defines the target model, live health-check runner, Playwright flow
 map explorer, generated UI regression tests, generated OpenAPI/API request
 tests, failure evidence contract, product memory learning, MCP run/rerun tools,
-and deterministic failure classification.
+deterministic failure classification, GitHub Action preview verification, and a
+local-first product dashboard.
 
 The next implementation pieces are:
 
-- PR preview verification and scheduled monitoring.
-- product verification history dashboard.
+- richer hosted/team dashboard packaging.

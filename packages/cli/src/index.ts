@@ -1,5 +1,5 @@
 import { spawn, spawnSync, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { dirname, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -29,12 +29,15 @@ import {
   CODEDECAY_PRODUCT_LATEST_REPORT_PATH,
   CODEDECAY_VERSION,
   createAnalysisReport,
+  dedupeStrings,
   productFailureBundlesFromProductTargetReport,
   riskLevelFromScore,
   shouldFailForRisk,
   type CodeDecayReport,
+  type ProductCheckKind,
   type ProductFailureClassification,
   type ProductFailureBundle,
+  type ProductFailureStep,
   type RiskLevel,
   type TestEvidenceMode
 } from "@submuxhq/codedecay-core";
@@ -145,6 +148,13 @@ interface ProductOptions {
   maxPages: number;
   maxActions: number;
   allowDestructiveActions: boolean;
+}
+
+interface DashboardOptions {
+  cwd?: string | undefined;
+  output?: string | undefined;
+  format: ConfigFormat;
+  inputPaths: string[];
 }
 
 interface DifferentialOptions {
@@ -651,7 +661,7 @@ const VALID_PRODUCT_FAILURE_CLASSIFICATIONS = new Set<ProductFailureClassificati
 ]);
 const VALID_PACKAGE_MANAGERS = new Set<PackageManager>(["npm", "pnpm", "yarn", "bun"]);
 const PACKAGE_NAME = "@submuxhq/codedecay";
-const COMMAND_ORDER = ["analyze", "snapshot", "redteam", "llm-review", "agent", "config", "memory", "memory-import", "memory-learn", "execute", "differential", "product", "mcp"] as const;
+const COMMAND_ORDER = ["analyze", "snapshot", "redteam", "llm-review", "agent", "config", "memory", "memory-import", "memory-learn", "execute", "differential", "product", "dashboard", "mcp"] as const;
 const UTILITY_COMMAND_ORDER = ["help", "man", "update", "uninstall", "version"] as const;
 const ROOT_FLAG_ALIASES = ["--help", "-h", "--version", "-V"] as const;
 const CODEDECAY_PURGE_FILE_PATTERN = /^codedecay(?:[-_.][a-z0-9._-]+)?\.(?:json|md|sarif|txt)$/i;
@@ -926,6 +936,29 @@ const HELP_DOCS: Record<string, CommandDoc> = {
       "Generated tests are written under `.codedecay/local/generated-tests/` and `.codedecay/local/generated-api-tests/` for review; CodeDecay never commits or promotes them automatically."
     ]
   },
+  dashboard: {
+    name: "dashboard",
+    summary: "Generate a static product verification dashboard.",
+    usage: ["codedecay dashboard [options]"],
+    description: [
+      "Discover local product run artifacts, redact sensitive values, and write a static HTML/JSON dashboard with per-failure bundle links."
+    ],
+    options: [
+      { flag: "--cwd <path>", description: "Repository working directory (default: current directory)" },
+      { flag: "--input <path>", description: "Additional product report JSON file or directory to include; can be repeated" },
+      { flag: "--output <path>", description: "Dashboard output directory (default: .codedecay/local/dashboard)" },
+      { flag: "--format <format>", description: "json or markdown summary to stdout (default: markdown)" }
+    ],
+    examples: [
+      "codedecay dashboard",
+      "codedecay dashboard --input .codedecay/local/product-trends --output public/codedecay-dashboard",
+      "codedecay dashboard --format json"
+    ],
+    notes: [
+      "Default discovery reads `.codedecay/local/product-runs/**/*.json` and `.codedecay/local/product-trends/**/*.json`.",
+      "The generated dashboard is static and local-first. It does not upload artifacts or require a hosted service."
+    ]
+  },
   mcp: {
     name: "mcp",
     summary: "Start the local MCP server.",
@@ -1018,6 +1051,7 @@ const COMMAND_HANDLERS: Record<string, CliCommandHandler> = {
   agent: runAgentCommand,
   analyze: runAnalyzeCommand,
   config: runConfigCommand,
+  dashboard: runDashboardCommand,
   differential: runDifferentialCommand,
   execute: runExecuteCommand,
   "llm-review": runLlmReviewCommand,
@@ -1360,6 +1394,476 @@ function shouldFailProductReportForClassifications(
   const failures = productFailureBundlesFromProductTargetReport(report);
   const gate = new Set(classifications);
   return failures.some((failure) => gate.has(failure.classification));
+}
+
+function runDashboardCommand(context: CliCommandContext): void {
+  const options = parseDashboardArgs(context.args);
+  const cwd = resolve(context.runtimeCwd, options.cwd ?? ".");
+  const rootDir = getRepoRootForCli(cwd, { format: "markdown" });
+  const outputDir = resolve(cwd, options.output ?? join(".codedecay", "local", "dashboard"));
+  resetProductDashboardFailures(outputDir);
+  const dashboard = createProductDashboard(rootDir, outputDir, options);
+
+  writeProductDashboard(outputDir, dashboard);
+  write(context.runtime.stdout, renderProductDashboardSummary(dashboard, options.format));
+}
+
+interface ProductDashboard {
+  tool: "CodeDecay";
+  version: string;
+  generatedAt: string;
+  outputDir: string;
+  summary: ProductDashboardSummary;
+  runs: ProductDashboardRun[];
+  failures: ProductDashboardFailure[];
+}
+
+interface ProductDashboardSummary {
+  runs: number;
+  targets: number;
+  passed: number;
+  failed: number;
+  blocked: number;
+  timedOut: number;
+  skipped: number;
+  failures: number;
+  flaky: number;
+  confirmedRegressions: number;
+}
+
+interface ProductDashboardRun {
+  id: string;
+  sourcePath: string;
+  generatedAt?: string | undefined;
+  status: ProductTargetStatus;
+  durationMs?: number | undefined;
+  targets: string[];
+  passed: number;
+  failed: number;
+  blocked: number;
+  timedOut: number;
+  skipped: number;
+}
+
+interface ProductDashboardFailure {
+  id: string;
+  runId: string;
+  title: string;
+  targetId: string;
+  checkId: string;
+  checkKind: ProductCheckKind;
+  priority: RiskLevel;
+  classification: ProductFailureClassification;
+  classificationConfidence?: number | undefined;
+  classificationEvidence?: string[] | undefined;
+  summary: string;
+  expected: string;
+  actual: string;
+  impactedFiles: string[];
+  rerunCommand: string;
+  jsonPath: string;
+  markdownPath: string;
+}
+
+function createProductDashboard(rootDir: string, outputDir: string, options: DashboardOptions): ProductDashboard {
+  const artifactPaths = discoverProductDashboardArtifacts(rootDir, options.inputPaths);
+  const runs: ProductDashboardRun[] = [];
+  const failures: ProductDashboardFailure[] = [];
+  const targetIds = new Set<string>();
+  const generatedAt = new Date().toISOString();
+
+  for (const artifactPath of artifactPaths) {
+    const report = loadProductDashboardReport(artifactPath);
+    if (!report) {
+      continue;
+    }
+
+    const runId = dashboardSlug(relativePathForArtifact(rootDir, artifactPath));
+    const run = productDashboardRunFromReport(runId, rootDir, artifactPath, report);
+    runs.push(run);
+    for (const targetId of run.targets) {
+      targetIds.add(targetId);
+    }
+
+    for (const bundle of productFailureBundlesFromProductTargetReport(report)) {
+      const sanitized = sanitizeProductFailureBundle(bundle);
+      const failureId = dashboardSlug(`${runId}-${sanitized.id}`);
+      const jsonPath = join("failures", `${failureId}.json`);
+      const markdownPath = join("failures", `${failureId}.md`);
+      failures.push({
+        id: failureId,
+        runId,
+        title: sanitized.title,
+        targetId: sanitized.target.id,
+        checkId: sanitized.checkId,
+        checkKind: sanitized.checkKind,
+        priority: sanitized.priority,
+        classification: sanitized.classification,
+        classificationConfidence: sanitized.classificationConfidence,
+        classificationEvidence: sanitized.classificationEvidence,
+        summary: sanitized.summary,
+        expected: sanitized.expected,
+        actual: sanitized.actual,
+        impactedFiles: sanitized.impactedFiles,
+        rerunCommand: sanitized.rerunCommand,
+        jsonPath,
+        markdownPath
+      });
+      writeProductDashboardFailure(outputDir, jsonPath, markdownPath, sanitized);
+    }
+  }
+
+  const sortedRuns = runs.sort((left, right) => (right.generatedAt ?? "").localeCompare(left.generatedAt ?? "") || left.id.localeCompare(right.id));
+  const sortedFailures = failures.sort((left, right) => {
+    const risk = priorityRank(right.priority) - priorityRank(left.priority);
+    if (risk !== 0) {
+      return risk;
+    }
+
+    return left.id.localeCompare(right.id);
+  });
+
+  return {
+    tool: "CodeDecay",
+    version: CODEDECAY_VERSION,
+    generatedAt,
+    outputDir: relativePathForArtifact(rootDir, outputDir),
+    summary: {
+      runs: sortedRuns.length,
+      targets: targetIds.size,
+      passed: sortedRuns.reduce((count, run) => count + run.passed, 0),
+      failed: sortedRuns.reduce((count, run) => count + run.failed, 0),
+      blocked: sortedRuns.reduce((count, run) => count + run.blocked, 0),
+      timedOut: sortedRuns.reduce((count, run) => count + run.timedOut, 0),
+      skipped: sortedRuns.reduce((count, run) => count + run.skipped, 0),
+      failures: sortedFailures.length,
+      flaky: sortedFailures.filter((failure) => failure.classification === "likely-flaky").length,
+      confirmedRegressions: sortedFailures.filter((failure) => failure.classification === "confirmed-regression").length
+    },
+    runs: sortedRuns,
+    failures: sortedFailures
+  };
+}
+
+function discoverProductDashboardArtifacts(rootDir: string, inputPaths: string[]): string[] {
+  const candidates = [
+    join(rootDir, ".codedecay", "local", "product-runs"),
+    join(rootDir, ".codedecay", "local", "product-trends"),
+    ...inputPaths.map((path) => resolve(rootDir, path))
+  ];
+  const discovered: string[] = [];
+
+  for (const candidate of candidates) {
+    discovered.push(...discoverJsonFiles(candidate));
+  }
+
+  return dedupeStrings(discovered.map((path) => resolve(path))).sort((left, right) => left.localeCompare(right));
+}
+
+function discoverJsonFiles(path: string): string[] {
+  if (!existsSync(path)) {
+    return [];
+  }
+
+  const stats = statSync(path);
+  if (stats.isFile()) {
+    return path.endsWith(".json") ? [path] : [];
+  }
+
+  if (!stats.isDirectory()) {
+    return [];
+  }
+
+  return readdirSync(path, { withFileTypes: true }).flatMap((entry) => {
+    const child = join(path, entry.name);
+    if (entry.isDirectory()) {
+      return discoverJsonFiles(child);
+    }
+
+    return entry.isFile() && entry.name.endsWith(".json") ? [child] : [];
+  });
+}
+
+function loadProductDashboardReport(path: string): Record<string, unknown> | undefined {
+  try {
+    const parsed = JSON.parse(readFileSync(path, "utf8"));
+    if (parsed && typeof parsed === "object" && Array.isArray((parsed as { targets?: unknown }).targets)) {
+      return parsed as Record<string, unknown>;
+    }
+  } catch {
+    return undefined;
+  }
+
+  return undefined;
+}
+
+function productDashboardRunFromReport(
+  runId: string,
+  rootDir: string,
+  artifactPath: string,
+  report: Record<string, unknown>
+): ProductDashboardRun {
+  const summary = dashboardRecord(report.summary);
+  const targets = Array.isArray(report.targets) ? report.targets.map(dashboardRecord).filter(Boolean) : [];
+  return {
+    id: runId,
+    sourcePath: relativePathForArtifact(rootDir, artifactPath),
+    generatedAt: dashboardString(report.generatedAt),
+    status: productTargetStatusValue(dashboardString(summary?.status)) ?? "skipped",
+    durationMs: dashboardNumber(summary?.durationMs),
+    targets: dedupeStrings(targets.map((target) => dashboardString(target?.id)).filter((id): id is string => Boolean(id))),
+    passed: dashboardNumber(summary?.passed) ?? targets.filter((target) => dashboardString(target?.status) === "passed").length,
+    failed: dashboardNumber(summary?.failed) ?? targets.filter((target) => dashboardString(target?.status) === "failed").length,
+    blocked: dashboardNumber(summary?.blocked) ?? targets.filter((target) => dashboardString(target?.status) === "blocked").length,
+    timedOut: dashboardNumber(summary?.timedOut) ?? targets.filter((target) => dashboardString(target?.status) === "timed_out").length,
+    skipped: dashboardNumber(summary?.skipped) ?? targets.filter((target) => dashboardString(target?.status) === "skipped").length
+  };
+}
+
+function writeProductDashboard(outputDir: string, dashboard: ProductDashboard): void {
+  mkdirSync(outputDir, { recursive: true });
+  writeFileSync(join(outputDir, "dashboard.json"), `${JSON.stringify(dashboard, null, 2)}\n`, "utf8");
+  writeFileSync(join(outputDir, "index.html"), renderProductDashboardHtml(dashboard), "utf8");
+}
+
+function resetProductDashboardFailures(outputDir: string): void {
+  rmSync(join(outputDir, "failures"), { recursive: true, force: true });
+}
+
+function writeProductDashboardFailure(
+  outputDir: string,
+  jsonPath: string,
+  markdownPath: string,
+  bundle: ProductFailureBundle
+): void {
+  mkdirSync(join(outputDir, "failures"), { recursive: true });
+  writeFileSync(join(outputDir, jsonPath), `${JSON.stringify(bundle, null, 2)}\n`, "utf8");
+  writeFileSync(join(outputDir, markdownPath), renderProductDashboardFailureMarkdown(bundle), "utf8");
+}
+
+function sanitizeProductFailureBundle(bundle: ProductFailureBundle): ProductFailureBundle {
+  return {
+    ...bundle,
+    target: {
+      ...bundle.target,
+      baseUrl: bundle.target.baseUrl ? sanitizeDashboardUrl(bundle.target.baseUrl) : undefined
+    },
+    title: redactDashboardText(bundle.title),
+    summary: redactDashboardText(bundle.summary),
+    failedStep: sanitizeDashboardStep(bundle.failedStep),
+    neighboringSteps: bundle.neighboringSteps.map(sanitizeDashboardStep),
+    artifacts: bundle.artifacts.map((artifact) => ({
+      ...artifact,
+      label: artifact.label ? redactDashboardText(artifact.label) : undefined,
+      description: artifact.description ? redactDashboardText(artifact.description) : undefined
+    })),
+    expected: redactDashboardText(bundle.expected),
+    actual: redactDashboardText(bundle.actual),
+    classificationEvidence: bundle.classificationEvidence?.map(redactDashboardText),
+    rootCauseHypothesis: bundle.rootCauseHypothesis ? redactDashboardText(bundle.rootCauseHypothesis) : undefined,
+    suggestedFixTasks: bundle.suggestedFixTasks.map(redactDashboardText),
+    rerunCommand: redactDashboardText(bundle.rerunCommand)
+  };
+}
+
+function sanitizeDashboardStep(step: ProductFailureStep): ProductFailureStep {
+  return {
+    ...step,
+    label: redactDashboardText(step.label),
+    expected: step.expected ? redactDashboardText(step.expected) : undefined,
+    actual: step.actual ? redactDashboardText(step.actual) : undefined
+  };
+}
+
+function sanitizeDashboardUrl(value: string): string {
+  try {
+    const url = new URL(value);
+    url.username = "";
+    url.password = "";
+    url.search = "";
+    url.hash = "";
+    return url.toString().replace(/\/$/, url.pathname === "/" ? "/" : "");
+  } catch {
+    return value.split(/[?#]/, 1)[0] ?? value;
+  }
+}
+
+function redactDashboardText(value: string): string {
+  return value
+    .replace(/https?:\/\/[^\s`)"']+/g, (url) => sanitizeDashboardUrl(url))
+    .replace(/\bBearer\s+[A-Za-z0-9._~+/=-]+/gi, "Bearer [redacted]")
+    .replace(/\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/gi, "[redacted-email]")
+    .replace(
+      /\b(token|access_token|refresh_token|api[_-]?key|secret|password|session|cookie)=([^&\s]+)/gi,
+      "$1=[redacted]"
+    )
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function renderProductDashboardSummary(dashboard: ProductDashboard, format: ConfigFormat): string {
+  if (format === "json") {
+    return `${JSON.stringify(dashboard, null, 2)}\n`;
+  }
+
+  return [
+    "## CodeDecay Product Dashboard",
+    "",
+    `Dashboard written to \`${dashboard.outputDir}\`.`,
+    "",
+    "| Metric | Count |",
+    "| --- | ---: |",
+    `| Runs | ${dashboard.summary.runs} |`,
+    `| Targets | ${dashboard.summary.targets} |`,
+    `| Failures | ${dashboard.summary.failures} |`,
+    `| Confirmed regressions | ${dashboard.summary.confirmedRegressions} |`,
+    `| Likely flaky | ${dashboard.summary.flaky} |`,
+    "",
+    dashboard.failures.length > 0 ? "Open `index.html` for failure bundle links and rerun commands." : "No product failures found.",
+    ""
+  ].join("\n");
+}
+
+function renderProductDashboardHtml(dashboard: ProductDashboard): string {
+  const failureRows = dashboard.failures
+    .map(
+      (failure) => `<tr>
+        <td>${escapeHtml(failure.priority)}</td>
+        <td>${escapeHtml(failure.classification)}</td>
+        <td>${escapeHtml(failure.targetId)}</td>
+        <td>${escapeHtml(failure.title)}</td>
+        <td><a href="${escapeAttribute(failure.markdownPath)}">Markdown</a> · <a href="${escapeAttribute(failure.jsonPath)}">JSON</a></td>
+      </tr>`
+    )
+    .join("\n");
+  const runRows = dashboard.runs
+    .map(
+      (run) => `<tr>
+        <td>${escapeHtml(run.generatedAt ?? "unknown")}</td>
+        <td>${escapeHtml(run.status)}</td>
+        <td>${escapeHtml(run.targets.join(", ") || "none")}</td>
+        <td>${escapeHtml(run.sourcePath)}</td>
+      </tr>`
+    )
+    .join("\n");
+
+  return `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>CodeDecay Product Dashboard</title>
+  <style>
+    :root { color-scheme: dark; font-family: ui-sans-serif, system-ui, sans-serif; background: #090909; color: #f4f1ec; }
+    body { margin: 0; padding: 32px; background: radial-gradient(circle at top left, #24160c, #090909 38%); }
+    main { max-width: 1120px; margin: 0 auto; }
+    .hero { border: 1px solid #2b2b2b; background: #111; border-radius: 24px; padding: 28px; box-shadow: 0 24px 80px rgba(0,0,0,.35); }
+    h1 { margin: 0 0 8px; font-size: clamp(2rem, 5vw, 4rem); letter-spacing: -.05em; }
+    .muted { color: #aaa39a; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 14px; margin: 24px 0; }
+    .card { border: 1px solid #2b2b2b; background: #151515; border-radius: 18px; padding: 18px; }
+    .num { font-size: 2rem; font-weight: 800; color: #f08a24; }
+    table { width: 100%; border-collapse: collapse; margin: 16px 0 32px; overflow: hidden; border-radius: 16px; }
+    th, td { border-bottom: 1px solid #272727; padding: 12px; text-align: left; vertical-align: top; }
+    th { color: #f08a24; background: #111; }
+    a { color: #f08a24; }
+    code { background: #1c1c1c; padding: 2px 6px; border-radius: 6px; }
+  </style>
+</head>
+<body>
+  <main>
+    <section class="hero">
+      <p class="muted">Generated ${escapeHtml(dashboard.generatedAt)}</p>
+      <h1>CodeDecay Product Dashboard</h1>
+      <p class="muted">Static product verification history. No backend, telemetry, or hosted service required.</p>
+      <div class="grid">
+        <div class="card"><div class="num">${dashboard.summary.runs}</div><div>Runs</div></div>
+        <div class="card"><div class="num">${dashboard.summary.targets}</div><div>Targets</div></div>
+        <div class="card"><div class="num">${dashboard.summary.failures}</div><div>Failures</div></div>
+        <div class="card"><div class="num">${dashboard.summary.confirmedRegressions}</div><div>Confirmed regressions</div></div>
+        <div class="card"><div class="num">${dashboard.summary.flaky}</div><div>Likely flaky</div></div>
+      </div>
+    </section>
+    <h2>Failures</h2>
+    <table>
+      <thead><tr><th>Priority</th><th>Classification</th><th>Target</th><th>Title</th><th>Bundle</th></tr></thead>
+      <tbody>${failureRows || '<tr><td colspan="5">No product failures found.</td></tr>'}</tbody>
+    </table>
+    <h2>Runs</h2>
+    <table>
+      <thead><tr><th>Generated</th><th>Status</th><th>Targets</th><th>Source</th></tr></thead>
+      <tbody>${runRows || '<tr><td colspan="4">No product run artifacts found.</td></tr>'}</tbody>
+    </table>
+  </main>
+</body>
+</html>
+`;
+}
+
+function renderProductDashboardFailureMarkdown(bundle: ProductFailureBundle): string {
+  return [
+    `# ${bundle.title}`,
+    "",
+    `- Classification: ${bundle.classification}${bundle.classificationConfidence !== undefined ? ` (${Math.round(bundle.classificationConfidence * 100)}% confidence)` : ""}`,
+    `- Priority: ${bundle.priority}`,
+    `- Target: ${bundle.target.id}${bundle.target.baseUrl ? ` (${bundle.target.baseUrl})` : ""}`,
+    `- Check: ${bundle.checkId} (${bundle.checkKind})`,
+    `- Expected: ${bundle.expected}`,
+    `- Actual: ${bundle.actual}`,
+    `- Rerun: \`${bundle.rerunCommand}\``,
+    "",
+    "## Evidence",
+    "",
+    ...(bundle.classificationEvidence ?? ["No classification evidence recorded."]).map((evidence) => `- ${evidence}`),
+    "",
+    "## Repair Tasks",
+    "",
+    ...bundle.suggestedFixTasks.map((task) => `- ${task}`),
+    ""
+  ].join("\n");
+}
+
+function dashboardRecord(value: unknown): Record<string, unknown> | undefined {
+  return value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : undefined;
+}
+
+function dashboardString(value: unknown): string | undefined {
+  return typeof value === "string" && value.trim().length > 0 ? value : undefined;
+}
+
+function dashboardNumber(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+function productTargetStatusValue(value: string | undefined): ProductTargetStatus | undefined {
+  return value === "passed" || value === "failed" || value === "skipped" || value === "blocked" || value === "timed_out"
+    ? value
+    : undefined;
+}
+
+function dashboardSlug(value: string): string {
+  return value
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 96) || "dashboard";
+}
+
+function escapeHtml(value: string): string {
+  return value.replace(/[&<>"']/g, (char) => {
+    const entities: Record<string, string> = {
+      "&": "&amp;",
+      "<": "&lt;",
+      ">": "&gt;",
+      '"': "&quot;",
+      "'": "&#39;"
+    };
+    return entities[char] ?? char;
+  });
+}
+
+function escapeAttribute(value: string): string {
+  return escapeHtml(value).replace(/`/g, "&#96;");
 }
 
 async function runDifferentialCommand(context: CliCommandContext): Promise<void> {
@@ -2313,6 +2817,73 @@ function parseProductArgs(args: string[]): ProductOptions {
     }
 
     throwUnknownOption(arg, "product");
+  }
+
+  return options;
+}
+
+function parseDashboardArgs(args: string[]): DashboardOptions {
+  const options: DashboardOptions = {
+    format: "markdown",
+    inputPaths: []
+  };
+
+  for (let index = 0; index < args.length; index += 1) {
+    const arg = args[index];
+
+    if (!arg) {
+      continue;
+    }
+
+    if (arg === "--help" || arg === "-h") {
+      throw new HelpRequested();
+    }
+
+    if (arg.startsWith("--cwd=")) {
+      options.cwd = arg.slice("--cwd=".length);
+      continue;
+    }
+
+    if (arg === "--cwd") {
+      options.cwd = requireValue(args, index, arg);
+      index += 1;
+      continue;
+    }
+
+    if (arg.startsWith("--input=")) {
+      options.inputPaths.push(arg.slice("--input=".length));
+      continue;
+    }
+
+    if (arg === "--input") {
+      options.inputPaths.push(requireValue(args, index, arg));
+      index += 1;
+      continue;
+    }
+
+    if (arg.startsWith("--output=")) {
+      options.output = arg.slice("--output=".length);
+      continue;
+    }
+
+    if (arg === "--output") {
+      options.output = requireValue(args, index, arg);
+      index += 1;
+      continue;
+    }
+
+    if (arg.startsWith("--format=")) {
+      options.format = parseConfigFormat(arg.slice("--format=".length));
+      continue;
+    }
+
+    if (arg === "--format") {
+      options.format = parseConfigFormat(requireValue(args, index, arg));
+      index += 1;
+      continue;
+    }
+
+    throwUnknownOption(arg, "dashboard");
   }
 
   return options;

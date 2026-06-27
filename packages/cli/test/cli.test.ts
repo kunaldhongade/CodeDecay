@@ -2378,6 +2378,74 @@ describe("codedecay product CLI contract", () => {
   });
 });
 
+describe("codedecay dashboard CLI contract", () => {
+  it("discovers product artifacts and writes a static dashboard with failure bundle links", async () => {
+    const repo = createLowRiskRepo();
+    writeDashboardProductRun(repo, ".codedecay/local/product-runs/run-1.json", {
+      generatedAt: "2026-06-27T10:00:00.000Z",
+      status: "failed",
+      targetId: "api",
+      baseUrl: "http://127.0.0.1:3000?token=secret",
+      requestUrl: "http://127.0.0.1:3000/api/users?token=secret",
+      error: "Expected documented status 200 but got 500."
+    });
+    writeDashboardProductRun(repo, ".codedecay/local/product-trends/run-2.json", {
+      generatedAt: "2026-06-27T11:00:00.000Z",
+      status: "passed",
+      targetId: "web",
+      baseUrl: "http://127.0.0.1:3000",
+      requestUrl: "http://127.0.0.1:3000/settings",
+      error: ""
+    });
+    writeFile(repo, "public/codedecay-dashboard/failures/stale.md", "old failure bundle");
+
+    const result = await run(["dashboard", "--output", "public/codedecay-dashboard", "--format", "json"], repo);
+    const dashboard = JSON.parse(result.stdout);
+    const outputDir = join(repo, "public/codedecay-dashboard");
+    const failure = dashboard.failures[0];
+
+    expect(result.exitCode).toBe(0);
+    expect(dashboard.summary).toMatchObject({
+      runs: 2,
+      targets: 2,
+      failures: 1,
+      confirmedRegressions: 1
+    });
+    expect(existsSync(join(outputDir, "index.html"))).toBe(true);
+    expect(existsSync(join(outputDir, "dashboard.json"))).toBe(true);
+    expect(existsSync(join(outputDir, failure.jsonPath))).toBe(true);
+    expect(existsSync(join(outputDir, failure.markdownPath))).toBe(true);
+    expect(existsSync(join(outputDir, "failures/stale.md"))).toBe(false);
+    expect(readFileSync(join(outputDir, "index.html"), "utf8")).toContain("CodeDecay Product Dashboard");
+    expect(readFileSync(join(outputDir, "index.html"), "utf8")).toContain(failure.markdownPath);
+  });
+
+  it("redacts sensitive product dashboard values by default", async () => {
+    const repo = createLowRiskRepo();
+    writeDashboardProductRun(repo, ".codedecay/local/product-runs/secret-run.json", {
+      generatedAt: "2026-06-27T10:00:00.000Z",
+      status: "failed",
+      targetId: "api",
+      baseUrl: "http://127.0.0.1:3000?token=secret",
+      requestUrl: "http://127.0.0.1:3000/api/users?token=secret",
+      error: "Bearer supersecret failed for user@example.com token=abc123"
+    });
+
+    const result = await run(["dashboard", "--format", "markdown"], repo);
+    const dashboardPath = join(repo, ".codedecay/local/dashboard/dashboard.json");
+    const htmlPath = join(repo, ".codedecay/local/dashboard/index.html");
+    const serialized = `${readFileSync(dashboardPath, "utf8")}\n${readFileSync(htmlPath, "utf8")}`;
+
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain("## CodeDecay Product Dashboard");
+    expect(serialized).not.toContain("supersecret");
+    expect(serialized).not.toContain("user@example.com");
+    expect(serialized).not.toContain("token=abc123");
+    expect(serialized).not.toContain("?token=secret");
+    expect(serialized).toContain("Bearer [redacted]");
+  });
+});
+
 describe("codedecay differential CLI contract", () => {
   it("reports changed structured probe output between base and head", async () => {
     const { repo, base, head } = createDifferentialRepo({ headValue: "head", allowCommands: true });
@@ -2851,6 +2919,77 @@ function writeLatestProductRunReport(repo: string): void {
                 }
               ]
             }
+          }
+        ],
+        safety: {
+          telemetrySent: false,
+          cloudDependency: false
+        }
+      },
+      null,
+      2
+    )
+  );
+}
+
+function writeDashboardProductRun(
+  repo: string,
+  path: string,
+  input: {
+    generatedAt: string;
+    status: "passed" | "failed";
+    targetId: string;
+    baseUrl: string;
+    requestUrl: string;
+    error: string;
+  }
+): void {
+  const failed = input.status === "failed";
+  writeFile(
+    repo,
+    path,
+    JSON.stringify(
+      {
+        tool: "CodeDecay",
+        version: "0.3.0",
+        generatedAt: input.generatedAt,
+        summary: {
+          status: input.status,
+          total: 1,
+          passed: failed ? 0 : 1,
+          failed: failed ? 1 : 0,
+          blocked: 0,
+          timedOut: 0,
+          skipped: 0,
+          durationMs: 25
+        },
+        targets: [
+          {
+            id: input.targetId,
+            status: input.status,
+            baseUrl: input.baseUrl,
+            generatedApiTestRun: failed
+              ? {
+                  status: "failed",
+                  failures: [
+                    {
+                      testId: "api-get-users",
+                      title: "GET /api/users returns a documented status",
+                      failingStep: "Run generated test.",
+                      error: input.error,
+                      request: {
+                        method: "GET",
+                        url: input.requestUrl
+                      },
+                      expected: "GET /api/users should return one of the documented statuses 200.",
+                      actual: input.error,
+                      impactedFiles: ["src/api/users.ts"],
+                      testSourcePath: ".codedecay/local/generated-api-tests/api/api.generated.spec.ts",
+                      rerunCommand: "npx codedecay product --target api --run-generated-api-tests --test-id api-get-users --format markdown"
+                    }
+                  ]
+                }
+              : undefined
           }
         ],
         safety: {
